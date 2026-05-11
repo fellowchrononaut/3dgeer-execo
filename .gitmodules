@@ -1,0 +1,3 @@
+[submodule "submodules/GaussianWrapping"]
+	path = submodules/GaussianWrapping
+	url = https://github.com/diego1401/GaussianWrapping.git
