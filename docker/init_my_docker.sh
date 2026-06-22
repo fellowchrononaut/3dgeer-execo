@@ -1,6 +1,6 @@
 #!/bin/bash          
 PROJECT_DIR="./"
-DATASET_DIR="/your/path/to/dataset"
+DATASET_DIR="/home/deos/s.jois/EXECO/Simulator_Validation/"
 sudo docker remove -f geer
 
 echo "mount projects: $PROJECT_DIR --> geer:/home"
