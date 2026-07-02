@@ -80,10 +80,27 @@ def main():
     parser.add_argument("--raymap_path", type=str, default=None)
 
     parser.add_argument("--iso", type=float, default=0.0)
-    parser.add_argument("--std_factor", type=float, default=3.0)
+    parser.add_argument("--std_factor", type=float, default=3.33)
     parser.add_argument("--max_pivots", type=int, default=1_500_000)
     parser.add_argument("--trunc_margin", type=float, default=None)
-    parser.add_argument("--n_binary_steps", type=int, default=8)
+    parser.add_argument("--n_binary_steps", type=int, default=10)
+    # -- Session E2: exact ray-integrated occupancy field --------------------
+    parser.add_argument("--sdf_mode", type=str, default="integrated",
+                         choices=["integrated", "tsdf"],
+                         help="'integrated' = exact ray-integrated occupancy "
+                              "(GW's quality path, forward-only CUDA integrate "
+                              "kernel); 'tsdf' = Session E depth-fusion field "
+                              "(fast preview).")
+    parser.add_argument("--use_searched_pivots", type=str, default=None,
+                         choices=["on", "off"],
+                         help="Walk each front pivot outward along the normal "
+                              "until the field crosses (GW get_searched_pivots). "
+                              "Default: on for --sdf_mode integrated, off for tsdf.")
+    parser.add_argument("--search_iter", type=int, default=5)
+    parser.add_argument("--search_step_size", type=float, default=0.33)
+    parser.add_argument("--max_field_eval_sec", type=float, default=180.0,
+                         help="If a calibration field eval exceeds this budget, "
+                              "search/refine stages subsample views (every 2nd).")
     parser.add_argument("--max_radius_factor", type=float, default=2.0,
                          help="Drop pivots farther than max_radius_factor * scene_radius "
                               "from the camera-center centroid before Delaunay (guards "
@@ -113,7 +130,12 @@ def main():
           f"{args.model_path} @ iteration {args.iteration}")
 
     cameras = scene.getTrainCameras()
-    stats_path = os.path.join(os.path.dirname(os.path.abspath(args.output)), "stats.txt")
+    # per-mesh stats file (Session E wrote a shared stats.txt; that clobbered
+    # the previous extraction's stats as soon as a second mesh was made)
+    stats_path = os.path.splitext(os.path.abspath(args.output))[0] + "_stats.txt"
+
+    use_searched_pivots = None if args.use_searched_pivots is None \
+        else (args.use_searched_pivots == "on")
 
     extract_mesh_pivot_mtet(
         gaussians=gaussians,
@@ -126,6 +148,11 @@ def main():
         trunc_margin=args.trunc_margin,
         n_binary_steps=args.n_binary_steps,
         max_radius_factor=args.max_radius_factor,
+        sdf_mode=args.sdf_mode,
+        use_searched_pivots=use_searched_pivots,
+        search_iter=args.search_iter,
+        search_step_size=args.search_step_size,
+        max_field_eval_sec=args.max_field_eval_sec,
         stats_path=stats_path,
     )
 
