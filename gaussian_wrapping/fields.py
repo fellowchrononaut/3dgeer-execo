@@ -22,12 +22,19 @@ field > 0 = empty space, field < 0 = occupied, surface at 0.
 Points seen by no camera default to occupied (tsdf = -1), matching
 AdaptiveTSDF's `initial_sdf_value=-1.0` default.
 """
+import math
 from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 
 from gaussian_wrapping.fisheye_proj import project_view_to_pixel
+from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer, integrate_points
+
+# geer-rasterizer tile size (cuda_rasterizer/config.h BLOCK_X/BLOCK_Y);
+# the Python-side tile binning below MUST match this exactly.
+_BLOCK_X = 16
+_BLOCK_Y = 16
 
 
 def world_to_view(camera, points: torch.Tensor) -> torch.Tensor:
@@ -141,3 +148,169 @@ def fuse_tsdf_at_points(
         out_chunks.append(tsdf)
 
     return torch.cat(out_chunks, dim=0)
+
+
+# ---------------------------------------------------------------------------
+# Session E2: exact ray-integrated occupancy field.
+# ported/adapted from GaussianWrapping submodules/diff-gaussian-rasterization/
+# cuda_rasterizer/forward.cu (integrateCUDA / Rasterizer::integrate) and
+# gaussian_wrapping/gaussian_renderer/ours.py (integrate_ours) -- see the
+# "Session E2" section of 3DGEERGW_EXECUTION.md for the exact semantics
+# ported: per query point x, per view v, A_v(x) = accumulated alpha along
+# the camera ray through x's own pixel, counting only Gaussians whose
+# (sorted) center depth <= t_x = ||x_view||; occupancy(x) = min over valid
+# views of A_v(x) (points valid in no view -> occupancy 0). This is GW's
+# actual quality extraction path ("ours"/exact_computation); the TSDF
+# depth-fusion field above is only their initialization helper.
+#
+# field(x) = 0.5 + iso - occupancy(x); surface at field = 0 (SAME sign
+# convention as fuse_tsdf_at_points above: field > 0 = empty, < 0 = occupied).
+# ---------------------------------------------------------------------------
+
+def _build_raster_settings(camera, pc, pipe, bg_color: torch.Tensor) -> GaussianRasterizationSettings:
+    """Minimal replica of gaussian_renderer.render()'s raster_settings
+    construction (kept in sync by hand -- factored out here rather than
+    refactoring render() itself so train.py's hot path stays untouched)."""
+    tanfovx = math.tan(camera.FoVx * 0.5)
+    tanfovy = math.tan(camera.FoVy * 0.5)
+    return GaussianRasterizationSettings(
+        image_height=camera.image_height,
+        image_width=camera.image_width,
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=1.0,
+        viewmatrix=camera.world_view_transform,
+        mirror_transformed_tan_theta=camera.mirror_transformed_tan_theta.cuda(),
+        mirror_transformed_tan_phi=camera.mirror_transformed_tan_phi.cuda(),
+        tan_theta=camera.tan_theta.cuda(),
+        tan_phi=camera.tan_phi.cuda(),
+        focal_x=float(camera.focal_x or 0.0),
+        focal_y=float(camera.focal_y or 0.0),
+        principal_x=float(camera.principal_x or 0.0),
+        principal_y=float(camera.principal_y or 0.0),
+        distortion_coeffs=camera.distortion_coeffs.cuda() if camera.render_model == 1 else torch.empty(0, device="cuda"),
+        raymap=camera.raymap.cuda() if camera.render_model == 1 else torch.empty(0, device="cuda"),
+        sh_degree=pc.active_sh_degree,
+        campos=camera.camera_center,
+        prefiltered=False,
+        debug=pipe.debug,
+        antialiasing=pipe.antialiasing,
+        render_mode=camera.render_model,
+        near_threshold=0.2,
+        asso_mode=0,
+    )
+
+
+@torch.no_grad()
+def _forward_buffers_for_view(camera, gaussians, pipe):
+    """No-grad forward pass that returns the raster_settings + rasterizer
+    state buffers for one view (retried once after `empty_cache()` on OOM,
+    matching `render_depth_maps`'s pattern above)."""
+    raster_settings = _build_raster_settings(camera, gaussians, pipe, torch.zeros(3, device="cuda"))
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    P = gaussians.get_xyz.shape[0]
+    colors_precomp = torch.zeros(P, 3, device="cuda")  # unused (no color output needed); skips SH eval
+    kwargs = dict(
+        means3D=gaussians.get_xyz,
+        opacities=gaussians.get_opacity,
+        colors_precomp=colors_precomp,
+        scales=gaussians.get_scaling,
+        rotations=gaussians.get_rotation,
+    )
+    try:
+        buf = rasterizer.forward_with_buffers(**kwargs)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        buf = rasterizer.forward_with_buffers(**kwargs)
+    return raster_settings, buf
+
+
+@torch.no_grad()
+def _integrate_alpha_chunk(camera, raster_settings, buf, x_view: torch.Tensor):
+    """A_v(x) for one view's already-built buffers + one chunk of
+    view-space points. Returns (alpha (n,), valid (n,) bool); `alpha` is
+    only meaningful where `valid` is True."""
+    n = x_view.shape[0]
+    device = x_view.device
+    u, v, valid = project_view_to_pixel(camera, x_view)
+    alpha_full = torch.zeros(n, device=device)
+    if not bool(valid.any()):
+        return alpha_full, valid
+
+    W, H = camera.image_width, camera.image_height
+    grid_x = (W + _BLOCK_X - 1) // _BLOCK_X
+    grid_y = (H + _BLOCK_Y - 1) // _BLOCK_Y
+    num_tiles = grid_x * grid_y
+
+    valid_idx = valid.nonzero(as_tuple=True)[0]
+    px = u[valid_idx].round().long().clamp(0, W - 1)
+    py = v[valid_idx].round().long().clamp(0, H - 1)
+    pix_id = (py * W + px).to(torch.int32).contiguous()
+    tval = x_view[valid_idx].norm(dim=-1).float().contiguous()
+
+    tile = (py // _BLOCK_Y) * grid_x + (px // _BLOCK_X)
+    order = torch.argsort(tile)
+    tile_sorted = tile[order]
+    q_point_order = order.to(torch.int32).contiguous()  # indices into (pix_id, tval)
+
+    counts = torch.bincount(tile_sorted, minlength=num_tiles)
+    ends = torch.cumsum(counts, dim=0).to(torch.int32)
+    starts = ends - counts.to(torch.int32)
+    q_ranges = torch.stack([starts, ends], dim=-1).to(torch.int32).contiguous()
+
+    alpha_valid = integrate_points(
+        raster_settings, buf["geomBuffer"], buf["binningBuffer"], buf["imgBuffer"],
+        buf["num_rendered"], buf["P"],
+        pix_id, tval, q_ranges, q_point_order,
+    )  # (n_valid,) aligned to valid_idx's own order
+
+    alpha_full[valid_idx] = alpha_valid
+    return alpha_full, valid
+
+
+@torch.no_grad()
+def evaluate_occupancy_integrated(
+    points: torch.Tensor,
+    cameras: List,
+    gaussians,
+    pipe,
+    iso: float = 0.0,
+    chunk: int = 2_000_000,
+) -> torch.Tensor:
+    """Exact ray-integrated occupancy field at `points` (N,3) world-space.
+
+    One forward render (buffer build) per camera (cannot cache all views'
+    8M-Gaussian state at once); each point chunk within that view reuses the
+    same buffers. occupancy(x) = min over valid views of A_v(x); points
+    valid in no view get occupancy 0 (vacant). Returns field = 0.5 + iso -
+    occupancy (SAME sign convention as fuse_tsdf_at_points: >0 empty, <0
+    occupied, surface at 0).
+    """
+    assert points.shape[-1] == 3
+    N = points.shape[0]
+    device = points.device
+
+    occupancy = torch.zeros(N, device=device)
+    any_valid = torch.zeros(N, dtype=torch.bool, device=device)
+
+    for camera in cameras:
+        raster_settings, buf = _forward_buffers_for_view(camera, gaussians, pipe)
+
+        for start in range(0, N, chunk):
+            end = min(start + chunk, N)
+            x_view = world_to_view(camera, points[start:end])
+            alpha, valid = _integrate_alpha_chunk(camera, raster_settings, buf, x_view)
+
+            occ_slice = occupancy[start:end]
+            valid_prev = any_valid[start:end]
+            both_valid = valid & valid_prev
+            updated = torch.where(
+                both_valid, torch.minimum(occ_slice, alpha),
+                torch.where(valid, alpha, occ_slice),
+            )
+            occupancy[start:end] = updated
+            any_valid[start:end] = valid_prev | valid
+
+    occupancy = torch.where(any_valid, occupancy, torch.zeros_like(occupancy))
+    return 0.5 + iso - occupancy

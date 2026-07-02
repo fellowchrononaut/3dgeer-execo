@@ -28,8 +28,8 @@ import torch
 import trimesh
 from scipy.spatial import Delaunay
 
-from gaussian_wrapping.pivots import extract_gaussian_pivots
-from gaussian_wrapping.fields import render_depth_maps, fuse_tsdf_at_points
+from gaussian_wrapping.pivots import extract_gaussian_pivots, get_searched_pivots
+from gaussian_wrapping.fields import render_depth_maps, fuse_tsdf_at_points, evaluate_occupancy_integrated
 
 # ---------------------------------------------------------------------------
 # Marching tetrahedra (ported from GaussianWrapping utils/tetmesh.py, which is
@@ -175,10 +175,12 @@ def _merge_mtet_chunks(a, b):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def _binary_search_refine(end_points, end_sdf, cameras, depth_maps, trunc_margin, n_steps=8):
-    """8-step bisection of each crossing edge, re-evaluating the TSDF field
-    (fuse_tsdf_at_points) at the midpoint instead of trusting the pivot-level
-    linear interpolation. end_points: (Nv,2,3); end_sdf: (Nv,2,1)."""
+def _binary_search_refine(end_points, end_sdf, field_fn, n_steps=8):
+    """n_steps-step bisection of each crossing edge, re-evaluating the field
+    (`field_fn`, either `fuse_tsdf_at_points` or
+    `evaluate_occupancy_integrated`, both (M,3) -> (M,)) at the midpoint
+    instead of trusting the pivot-level linear interpolation. end_points:
+    (Nv,2,3); end_sdf: (Nv,2,1)."""
     lo = end_points[:, 0, :].clone()
     hi = end_points[:, 1, :].clone()
     lo_sdf = end_sdf[:, 0, 0].clone()
@@ -186,7 +188,7 @@ def _binary_search_refine(end_points, end_sdf, cameras, depth_maps, trunc_margin
 
     for _ in range(n_steps):
         mid = 0.5 * (lo + hi)
-        mid_sdf = fuse_tsdf_at_points(mid, cameras, depth_maps, trunc_margin)
+        mid_sdf = field_fn(mid)
         same_as_lo = (mid_sdf * lo_sdf) >= 0
         lo = torch.where(same_as_lo.unsqueeze(-1), mid, lo)
         lo_sdf = torch.where(same_as_lo, mid_sdf, lo_sdf)
@@ -250,15 +252,46 @@ def extract_mesh_pivot_mtet(
     pipe,
     output_path: str,
     iso: float = 0.0,
-    std_factor: float = 3.0,
+    std_factor: float = 3.33,
     max_pivots: Optional[int] = 1_500_000,
     trunc_margin: Optional[float] = None,
-    n_binary_steps: int = 8,
+    n_binary_steps: int = 10,
     max_radius_factor: Optional[float] = 2.0,
+    sdf_mode: str = "integrated",
+    use_searched_pivots: Optional[bool] = None,
+    search_iter: int = 5,
+    search_step_size: float = 0.33,
+    field_chunk: Optional[int] = None,
+    max_field_eval_sec: float = 180.0,
     stats_path: Optional[str] = None,
 ):
     """Full pivot-based marching-tetrahedra pipeline. Returns a dict of
-    pipeline statistics (also written to `stats_path` if given)."""
+    pipeline statistics (also written to `stats_path` if given).
+
+    Args (Session E2 additions):
+        sdf_mode: "integrated" (GW's actual quality path -- exact
+            ray-integrated occupancy via the geer-rasterizer's forward-only
+            `integrate_points` CUDA kernel, see gaussian_wrapping/fields.py::
+            evaluate_occupancy_integrated) or "tsdf" (Session E's
+            depth-fusion field, kept as the fast preview mode).
+        use_searched_pivots: if True, pivots are refined via
+            `pivots.get_searched_pivots` (walks the front pivot outward
+            along the normal until it crosses the surface) instead of the
+            fixed `std_factor` offset. Defaults to True for "integrated"
+            (where the extra field evals are affordable/worthwhile) and
+            False for "tsdf" (where fuse_tsdf_at_points is cheap enough
+            that the fixed offset is not the bottleneck, and GW itself only
+            pairs searched pivots with the exact field).
+        field_chunk: point-chunk size passed to the field evaluator (None
+            uses each field function's own default: 500k for tsdf, 2M for
+            integrated).
+        max_field_eval_sec: if a calibration field eval (integrated mode
+            only) exceeds this, subsequent search/refine-stage field evals
+            use every 2nd camera to bound wall time (per
+            3DGEERGW_EXECUTION.md Session E2 End-to-end verification note).
+            The final pivot-SDF eval (which fixes mesh topology) and the
+            "tsdf" mode are unaffected.
+    """
     stats = {}
     t_start = time.time()
 
@@ -269,7 +302,7 @@ def extract_mesh_pivot_mtet(
     scene_radius = (cam_centers - avg_center).norm(dim=-1).max().item() * 1.1
     stats["scene_radius"] = scene_radius
 
-    # -- 1. Pivots --------------------------------------------------------
+    # -- 1. Field callable + pivots ------------------------------------------
     t0 = time.time()
     means = gaussians.get_xyz.detach()
     scales = gaussians.get_scaling.detach()
@@ -294,10 +327,61 @@ def extract_mesh_pivot_mtet(
         normals, opacities = normals[g_keep], opacities[g_keep]
         stats["n_gaussians_in_radius"] = int(means.shape[0])
 
-    pivots, pivot_scales = extract_gaussian_pivots(
-        means, scales, rotations, normals,
-        opacities=opacities, std_factor=std_factor, max_pivots=max_pivots,
-    )
+    # -- field callable (used for pivot evaluation AND binary-search
+    #    refinement below) -----------------------------------------------
+    if sdf_mode == "tsdf":
+        t0 = time.time()
+        depth_maps = render_depth_maps(cameras, gaussians, pipe)
+        stats["t_render_depth_sec"] = time.time() - t0
+        print(f"[mesh_extraction] rendered {len(depth_maps)} depth maps in "
+              f"{stats['t_render_depth_sec']:.1f}s")
+        tsdf_chunk = field_chunk if field_chunk is not None else 500_000
+        field_fn = lambda pts: fuse_tsdf_at_points(pts, cameras, depth_maps, trunc_margin, chunk_size=tsdf_chunk)
+        field_fn_refine = field_fn
+        if use_searched_pivots is None:
+            use_searched_pivots = False
+    elif sdf_mode == "integrated":
+        integrated_chunk = field_chunk if field_chunk is not None else 2_000_000
+        field_fn = lambda pts: evaluate_occupancy_integrated(
+            pts, cameras, gaussians, pipe, iso=0.0, chunk=integrated_chunk)
+        if use_searched_pivots is None:
+            use_searched_pivots = True
+
+        # Calibrate on a modest, representative sample (post radius-crop
+        # Gaussian centers) to decide whether the (many-call) search/refine
+        # stages should subsample views to stay within budget. The final
+        # pivot-SDF eval below always uses the full camera set.
+        t0 = time.time()
+        calib_n = min(50_000, means.shape[0])
+        _ = field_fn(means[:calib_n])
+        stats["t_field_eval_calibration_sec"] = time.time() - t0
+        if stats["t_field_eval_calibration_sec"] > max_field_eval_sec and len(cameras) > 4:
+            refine_cameras = cameras[::2]
+            field_fn_refine = lambda pts: evaluate_occupancy_integrated(
+                pts, refine_cameras, gaussians, pipe, iso=0.0, chunk=integrated_chunk)
+            stats["refine_view_subsampled"] = True
+            print(f"[mesh_extraction] field eval on {calib_n} pts took "
+                  f"{stats['t_field_eval_calibration_sec']:.1f}s > {max_field_eval_sec:.0f}s budget -- "
+                  f"subsampling views ({len(refine_cameras)}/{len(cameras)}) for search/refine stages")
+        else:
+            field_fn_refine = field_fn
+            stats["refine_view_subsampled"] = False
+    else:
+        raise ValueError(f"Unknown sdf_mode: {sdf_mode!r} (expected 'integrated' or 'tsdf')")
+    stats["sdf_mode"] = sdf_mode
+    stats["use_searched_pivots"] = use_searched_pivots
+
+    if use_searched_pivots:
+        pivots, pivot_scales = get_searched_pivots(
+            means, scales, rotations, normals, field_fn_refine,
+            opacities=opacities, std_factor=std_factor, max_pivots=max_pivots,
+            search_iter=search_iter, step_size=search_step_size,
+        )
+    else:
+        pivots, pivot_scales = extract_gaussian_pivots(
+            means, scales, rotations, normals,
+            opacities=opacities, std_factor=std_factor, max_pivots=max_pivots,
+        )
     stats["n_pivots_raw"] = int(pivots.shape[0])
 
     # -- 1b. Radius crop (NOT in the original Session E spec; added to pass
@@ -327,27 +411,21 @@ def extract_mesh_pivot_mtet(
           f"{stats['n_pivots_raw']} raw (from {stats['n_gaussians']} Gaussians) "
           f"in {stats['t_pivots_sec']:.1f}s")
 
-    # -- 2. Depth maps + TSDF at pivots -------------------------------------
+    # -- 2. Field at pivots ---------------------------------------------------
     t0 = time.time()
-    depth_maps = render_depth_maps(cameras, gaussians, pipe)
-    stats["t_render_depth_sec"] = time.time() - t0
-    print(f"[mesh_extraction] rendered {len(depth_maps)} depth maps in "
-          f"{stats['t_render_depth_sec']:.1f}s")
-
-    t0 = time.time()
-    pivot_sdf = fuse_tsdf_at_points(pivots, cameras, depth_maps, trunc_margin)
-    stats["t_fuse_tsdf_sec"] = time.time() - t0
+    pivot_sdf = field_fn(pivots)
+    stats["t_fuse_field_sec"] = time.time() - t0
     n_pos = int((pivot_sdf > 0).sum().item())
     n_neg = int((pivot_sdf < 0).sum().item())
     n_trunc_pos = int((pivot_sdf >= 0.999).sum().item())
     n_trunc_neg = int((pivot_sdf <= -0.999).sum().item())
-    stats["tsdf_frac_positive"] = n_pos / pivot_sdf.numel()
-    stats["tsdf_frac_negative"] = n_neg / pivot_sdf.numel()
-    stats["tsdf_frac_truncated_positive"] = n_trunc_pos / pivot_sdf.numel()
-    stats["tsdf_frac_truncated_negative"] = n_trunc_neg / pivot_sdf.numel()
-    print(f"[mesh_extraction] pivot TSDF fused in {stats['t_fuse_tsdf_sec']:.1f}s -- "
-          f"frac positive={stats['tsdf_frac_positive']:.4f}, "
-          f"frac negative={stats['tsdf_frac_negative']:.4f}")
+    stats["field_frac_positive"] = n_pos / pivot_sdf.numel()
+    stats["field_frac_negative"] = n_neg / pivot_sdf.numel()
+    stats["field_frac_truncated_positive"] = n_trunc_pos / pivot_sdf.numel()
+    stats["field_frac_truncated_negative"] = n_trunc_neg / pivot_sdf.numel()
+    print(f"[mesh_extraction] pivot field ({sdf_mode}) evaluated in {stats['t_fuse_field_sec']:.1f}s -- "
+          f"frac positive={stats['field_frac_positive']:.4f}, "
+          f"frac negative={stats['field_frac_negative']:.4f}")
 
     # -- 3. Delaunay --------------------------------------------------------
     t0 = time.time()
@@ -390,7 +468,7 @@ def extract_mesh_pivot_mtet(
     t0 = time.time()
     if n_binary_steps > 0:
         verts = _binary_search_refine(
-            end_points, end_sdf - iso, cameras, depth_maps, trunc_margin, n_steps=n_binary_steps,
+            end_points, end_sdf - iso, field_fn_refine, n_steps=n_binary_steps,
         )
     else:
         verts = verts_linear

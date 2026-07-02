@@ -76,6 +76,24 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const bool antialiasing,
 	const bool debug);
 		
+torch::Tensor IntegratePointsCUDA(
+	const int P,
+	const int image_height,
+	const int image_width,
+	const int mode,
+	const float focal_x, float focal_y,
+	const torch::Tensor& tan_theta,
+	const torch::Tensor& tan_phi,
+	const torch::Tensor& raymap,
+	const torch::Tensor& geomBuffer,
+	const int R,
+	const torch::Tensor& binningBuffer,
+	const torch::Tensor& imageBuffer,
+	const torch::Tensor& q_pix_id,
+	const torch::Tensor& q_tval,
+	const torch::Tensor& q_ranges,
+	const torch::Tensor& q_point_order);
+
 torch::Tensor markVisible(
 		torch::Tensor& means3D,
 		torch::Tensor& viewmatrix);

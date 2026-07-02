@@ -235,8 +235,123 @@ class GaussianRasterizer(nn.Module):
             shs,
             colors_precomp,
             opacities,
-            scales, 
+            scales,
             rotations,
-            raster_settings, 
+            raster_settings,
         )
+
+    def forward_with_buffers(self, means3D, opacities, shs=None, colors_precomp=None, scales=None, rotations=None):
+        """Session E2: no-grad forward that also returns the rasterizer's
+        internal state buffers (geomBuffer/binningBuffer/imgBuffer +
+        num_rendered), for reuse by `integrate_points` below. Calls
+        `_C.rasterize_gaussians` directly (bypassing `_RasterizeGaussians`'s
+        autograd `Function`) -- mesh extraction is always run under
+        `torch.no_grad()`, so no autograd bookkeeping is needed here. Does
+        NOT touch or share state with the differentiable `forward()` path
+        above.
+        """
+        raster_settings = self.raster_settings
+
+        if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
+            raise Exception('Please provide excatly one of either SHs or precomputed colors!')
+
+        if ((scales is None or rotations is None)):
+            raise Exception('Please provide both scale and rotation (cov3D_precomp is not supported here)!')
+
+        if shs is None:
+            shs = torch.Tensor([])
+        if colors_precomp is None:
+            colors_precomp = torch.Tensor([])
+
+        args = (
+            raster_settings.bg,
+            means3D,
+            colors_precomp,
+            opacities,
+            scales,
+            rotations,
+            raster_settings.scale_modifier,
+            raster_settings.viewmatrix,
+            raster_settings.mirror_transformed_tan_theta,
+            raster_settings.mirror_transformed_tan_phi,
+            raster_settings.tan_theta,
+            raster_settings.tan_phi,
+            raster_settings.focal_x, raster_settings.focal_y,
+            raster_settings.principal_x, raster_settings.principal_y,
+            raster_settings.distortion_coeffs,
+            raster_settings.raymap,
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            raster_settings.image_height,
+            raster_settings.image_width,
+            shs,
+            raster_settings.sh_degree,
+            raster_settings.campos,
+            raster_settings.prefiltered,
+            raster_settings.antialiasing,
+            raster_settings.render_mode,
+            raster_settings.near_threshold,
+            raster_settings.debug,
+            raster_settings.asso_mode,
+        )
+
+        with torch.no_grad():
+            (num_rendered, color, radii, kernel_times, ranges, geomBuffer,
+             binningBuffer, imgBuffer, invdepths, median_depth, gidx) = _C.rasterize_gaussians(*args)
+
+        return {
+            "num_rendered": num_rendered,
+            "geomBuffer": geomBuffer,
+            "binningBuffer": binningBuffer,
+            "imgBuffer": imgBuffer,
+            "median_depth": median_depth,
+            "radii": radii,
+            "P": means3D.shape[0],
+        }
+
+
+def integrate_points(raster_settings, geomBuffer, binningBuffer, imgBuffer, num_rendered, P,
+                      q_pix_id, q_tval, q_ranges, q_point_order):
+    """Session E2: forward-only ray-integrated occupancy at query points,
+    reusing the buffers a prior `GaussianRasterizer.forward_with_buffers`
+    call produced for this view. No autograd (extraction runs under
+    `torch.no_grad()`).
+
+    Args:
+        raster_settings: the SAME `GaussianRasterizationSettings` used to
+            produce `geomBuffer`/`binningBuffer`/`imgBuffer` (only
+            image_height/width, render_mode, focal_x/y, tan_theta/tan_phi,
+            raymap are read).
+        num_rendered (int): `forward_with_buffers()["num_rendered"]`.
+        P (int): number of Gaussians (`forward_with_buffers()["P"]`).
+        q_pix_id (IntTensor, (Q,)): pixel id per valid query point.
+        q_tval (FloatTensor, (Q,)): ray parameter ||x_view|| per valid point.
+        q_ranges (IntTensor, (num_tiles, 2)): per-tile [start,end) into
+            q_point_order (SAME tile indexing as the renderer: tile =
+            (v // BLOCK_Y) * grid_x + u // BLOCK_X, BLOCK_X=BLOCK_Y=16).
+        q_point_order (IntTensor, (Q,)): query indices sorted by tile.
+
+    Returns:
+        FloatTensor (Q,): alpha_integrated = 1 - T for each query point.
+    """
+    with torch.no_grad():
+        out_alpha_integrated = _C.integrate_points(
+            int(P),
+            raster_settings.image_height,
+            raster_settings.image_width,
+            raster_settings.render_mode,
+            raster_settings.focal_x, raster_settings.focal_y,
+            raster_settings.tan_theta,
+            raster_settings.tan_phi,
+            raster_settings.raymap,
+            geomBuffer,
+            int(num_rendered),
+            binningBuffer,
+            imgBuffer,
+            q_pix_id,
+            q_tval,
+            q_ranges,
+            q_point_order,
+        )
+    return out_alpha_integrated
 

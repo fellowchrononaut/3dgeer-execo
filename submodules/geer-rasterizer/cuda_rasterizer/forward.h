@@ -81,6 +81,29 @@ namespace FORWARD
 		float* depth,
 		float* out_median_depth,
 		int*   out_gidx);
+
+	// Session E2: exact ray-integrated occupancy at arbitrary query points.
+	// Reuses the SAME tile ranges + depth-sorted point_list renderCUDA uses.
+	void integrate(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int W, int H,
+		int mode,
+		float focal_x, float focal_y,
+		const float* tan_theta,
+		const float* tan_phi,
+		const float* raymap,
+		const float4* pbf_tan,
+		const float3* points_xyz_view,
+		const float2* h_opacity,
+		const float3* w2o,
+		const float* depths,
+		const int* q_pix_id,
+		const float* q_tval,
+		const uint2* q_ranges,
+		const uint32_t* q_point_order,
+		float* out_alpha_integrated);
 }
 
 #endif

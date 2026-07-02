@@ -14,6 +14,8 @@
 
 #include <vector>
 #include <functional>
+#include <cstdint>
+#include <cuda_runtime.h>
 
 namespace CudaRasterizer
 {
@@ -67,6 +69,31 @@ namespace CudaRasterizer
 			float near_threshold = 0.2f,
 			bool debug = false,
 			int asso_mode = 0);
+
+		// Session E2: exact ray-integrated occupancy at arbitrary query points.
+		// Reconstructs GeometryState/BinningState/ImageState from the buffers a
+		// prior forward() call produced (SAME pattern as backward() below), then
+		// launches FORWARD::integrate. Forward-only: no gradients, no state
+		// mutation of the buffers.
+		static void integratePoints(
+			const int P,
+			const int width, int height,
+			const int mode,
+			const float focal_x, float focal_y,
+			const float* tan_theta,
+			const float* tan_phi,
+			const float* raymap,
+			char* geom_buffer,
+			const int R,
+			char* binning_buffer,
+			char* img_buffer,
+			const int Q,
+			const int* q_pix_id,
+			const float* q_tval,
+			const uint2* q_ranges,
+			const uint32_t* q_point_order,
+			float* out_alpha_integrated,
+			bool debug = false);
 
 		static void backward(
 			const int P, int D, int M, int R,

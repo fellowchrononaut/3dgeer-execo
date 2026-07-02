@@ -506,6 +506,57 @@ int CudaRasterizer::Rasterizer::forward(
 	return num_rendered;
 }
 
+// Session E2: exact ray-integrated occupancy at arbitrary query points.
+// Reconstructs GeometryState/BinningState/ImageState from the buffers a
+// prior forward() call produced -- SAME reconstruction pattern as
+// backward() below (geom_buffer/binning_buffer/img_buffer + P/R/W*H) --
+// then launches FORWARD::integrate over the SAME per-tile Gaussian ranges
+// and depth-sorted point_list the render kernel used. Forward-only: does
+// not touch or invalidate the reconstructed buffers.
+void CudaRasterizer::Rasterizer::integratePoints(
+	const int P,
+	const int width, int height,
+	const int mode,
+	const float focal_x, float focal_y,
+	const float* tan_theta,
+	const float* tan_phi,
+	const float* raymap,
+	char* geom_buffer,
+	const int R,
+	char* binning_buffer,
+	char* img_buffer,
+	const int Q,
+	const int* q_pix_id,
+	const float* q_tval,
+	const uint2* q_ranges,
+	const uint32_t* q_point_order,
+	float* out_alpha_integrated,
+	bool debug)
+{
+	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
+	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
+	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
+
+	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+	const dim3 block(BLOCK_X, BLOCK_Y, 1);
+
+	CHECK_CUDA(FORWARD::integrate(
+		tile_grid, block,
+		imgState.ranges,
+		binningState.point_list,
+		width, height,
+		mode,
+		focal_x, focal_y,
+		tan_theta, tan_phi, raymap,
+		geomState.pbf_tan,
+		geomState.means3D_view,
+		geomState.h_opacity,
+		geomState.w2o,
+		geomState.depths,
+		q_pix_id, q_tval, q_ranges, q_point_order,
+		out_alpha_integrated), debug)
+}
+
 // Produce necessary gradients for optimization, corresponding
 // to forward render pass
 void CudaRasterizer::Rasterizer::backward(

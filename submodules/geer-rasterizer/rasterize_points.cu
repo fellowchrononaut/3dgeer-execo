@@ -259,6 +259,60 @@ RasterizeGaussiansBackwardCUDA(
   return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dsh, dL_dscales, dL_drotations);
 }
 
+// Session E2: exact ray-integrated occupancy at arbitrary query points.
+// Reconstructs rasterizer state from the buffers a prior (no-grad)
+// RasterizeGaussiansCUDA call produced -- SAME buffer-reconstruction inputs
+// as RasterizeGaussiansBackwardCUDA above (P, W, H, R, mode, focal_x/y,
+// tan_theta/tan_phi/raymap, geomBuffer/binningBuffer/imageBuffer) -- plus
+// the per-query-point tile-binned arrays built on the Python side
+// (gaussian_wrapping/fields.py). Forward-only: no autograd, no gradients.
+torch::Tensor IntegratePointsCUDA(
+	const int P,
+	const int image_height,
+	const int image_width,
+	const int mode,
+	const float focal_x, float focal_y,
+	const torch::Tensor& tan_theta,
+	const torch::Tensor& tan_phi,
+	const torch::Tensor& raymap,
+	const torch::Tensor& geomBuffer,
+	const int R,
+	const torch::Tensor& binningBuffer,
+	const torch::Tensor& imageBuffer,
+	const torch::Tensor& q_pix_id,      // (Q,) int32, pixel id per valid query point
+	const torch::Tensor& q_tval,        // (Q,) float32, ||x_view|| per valid query point
+	const torch::Tensor& q_ranges,      // (num_tiles, 2) int32, [start,end) into q_point_order
+	const torch::Tensor& q_point_order) // (Q,) int32, query indices sorted by tile
+{
+	const int Q = q_pix_id.size(0);
+	auto float_opts = q_tval.options().dtype(torch::kFloat32);
+	torch::Tensor out_alpha_integrated = torch::zeros({Q}, float_opts);
+
+	if (P != 0 && Q != 0)
+	{
+		CudaRasterizer::Rasterizer::integratePoints(
+			P,
+			image_width, image_height,
+			mode,
+			focal_x, focal_y,
+			tan_theta.numel() > 0 ? tan_theta.contiguous().data<float>() : nullptr,
+			tan_phi.numel() > 0 ? tan_phi.contiguous().data<float>() : nullptr,
+			raymap.numel() > 0 ? raymap.contiguous().data<float>() : nullptr,
+			reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
+			R,
+			reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
+			reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
+			Q,
+			q_pix_id.contiguous().data<int>(),
+			q_tval.contiguous().data<float>(),
+			reinterpret_cast<const uint2*>(q_ranges.contiguous().data_ptr<int>()),
+			reinterpret_cast<const uint32_t*>(q_point_order.contiguous().data_ptr<int>()),
+			out_alpha_integrated.contiguous().data<float>());
+	}
+
+	return out_alpha_integrated;
+}
+
 torch::Tensor markVisible(
 		torch::Tensor& means3D,
 		torch::Tensor& viewmatrix)

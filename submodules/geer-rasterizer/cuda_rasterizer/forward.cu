@@ -1192,6 +1192,197 @@ void FORWARD::render(
 		out_gidx);
 }
 
+// Session E2: exact ray-integrated occupancy at arbitrary query points.
+// ported/adapted from GaussianWrapping submodules/diff-gaussian-rasterization_ours
+// cuda_rasterizer/sample_forward.cu :: evaluateTransmittanceCUDA (architecture:
+// one block per tile, per-tile point range processed in BLOCK_SIZE-strided
+// rounds, inner sweep over the SAME depth-sorted Gaussian tile-batches
+// renderCUDA uses). The per-Gaussian alpha math (p_obj/d_obj/power_mah via
+// w2o rows) and the mode-0/1/2 rayf lookup are copied verbatim from
+// renderCUDA above (3DGEER's own ray-Gaussian formulation, not GOF's
+// ray-plane one) -- only the termination rule differs: no test_T<0.0001
+// early-out; instead a point stops once the (sorted-ascending) Gaussian
+// depth exceeds the point's own ray parameter t_x = ||x_view||.
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+integrateCUDA(
+	const uint2* __restrict__ ranges,        // per-tile Gaussian range (SAME as renderCUDA)
+	const uint32_t* __restrict__ point_list, // depth-sorted Gaussian ids (SAME as renderCUDA)
+	int W, int H,
+	const int mode,
+	const float focal_x, float focal_y,
+	const float* tan_theta,
+	const float* tan_phi,
+	const float* raymap,
+	const float4* __restrict__ pbf_tan,
+	const float3* __restrict__ points_xyz_view,
+	const float2* __restrict__ h_opacity,
+	const float3* __restrict__ w2o_mat,
+	const float* __restrict__ depths,        // per-Gaussian Euclidean depth (GeometryState.depths)
+	const int* __restrict__ q_pix_id,        // per-query-point pixel id
+	const float* __restrict__ q_tval,        // per-query-point ray parameter t_x = ||x_view||
+	const uint2* __restrict__ q_ranges,      // per-tile query-point range
+	const uint32_t* __restrict__ q_point_order, // query indices sorted by tile
+	float* __restrict__ out_alpha_integrated // [num_query_points] 1 - T
+)
+{
+	auto block = cg::this_thread_block();
+	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	uint32_t tile_id = block.group_index().y * horizontal_blocks + block.group_index().x;
+
+	// Gaussian range for this tile (depth-sorted, same buffers renderCUDA uses).
+	uint2 range = ranges[tile_id];
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+	// Query-point range for this tile.
+	uint2 q_range = q_ranges[tile_id];
+	const int q_total = q_range.y - q_range.x;
+	const int q_rounds = (q_total + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+	__shared__ float3 collected_xyz[BLOCK_SIZE];
+	__shared__ float2 collected_h_opacity[BLOCK_SIZE];
+	__shared__ float3 collected_w2o[BLOCK_SIZE * 3];
+	__shared__ float4 collected_pbf_tan[BLOCK_SIZE];
+	__shared__ float collected_depth[BLOCK_SIZE];
+
+	// Each thread owns (at most) one query point per q-round; the whole block
+	// advances through q_rounds together so every thread hits the same number
+	// of block.sync() calls regardless of how many points it personally owns.
+	for (int qr = 0; qr < q_rounds; qr++)
+	{
+		int q_progress = qr * BLOCK_SIZE + block.thread_rank();
+		bool has_point = q_progress < q_total;
+
+		uint32_t qidx = has_point ? q_point_order[q_range.x + q_progress] : 0;
+		int pix_id = has_point ? q_pix_id[qidx] : 0;
+		float t_x = has_point ? q_tval[qidx] : 0.0f;
+
+		float3 rayf = make_float3(0.0f, 0.0f, 1.0f);
+		if (has_point)
+		{
+			int px = pix_id % W;
+			int py = pix_id / W;
+			if (mode == 0) {
+				rayf = make_float3((float)tan_theta[min(px, W - 1)], (float)tan_phi[min(py, H - 1)], 1.f);
+			} else if (mode == 1) {
+				rayf = make_float3((float)raymap[pix_id * 3], (float)raymap[pix_id * 3 + 1], (float)raymap[pix_id * 3 + 2]);
+			} else {
+				rayf = { ((float)px + 0.5f) / focal_x - W / (2.0f * focal_x), ((float)py + 0.5f) / focal_y - H / (2.0f * focal_y), 1.0f };
+			}
+		}
+
+		float T = 1.0f;
+		bool done = !has_point;
+
+		int toDo = range.y - range.x;
+		for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+		{
+			int num_done = __syncthreads_count(done);
+			if (num_done == BLOCK_SIZE)
+				break;
+
+			// Collectively fetch per-Gaussian data from global to shared (SAME
+			// batch every thread in the block reads, regardless of its own
+			// query point -- mirrors renderCUDA's collective-fetch pattern).
+			int progress = i * BLOCK_SIZE + block.thread_rank();
+			if (range.x + progress < range.y)
+			{
+				int coll_id = point_list[range.x + progress];
+				int t = block.thread_rank();
+				collected_xyz[t] = points_xyz_view[coll_id];
+				collected_h_opacity[t] = h_opacity[coll_id];
+				for (int j = 0; j < 3; j++)
+					collected_w2o[t * 3 + j] = w2o_mat[coll_id * 3 + j];
+				collected_pbf_tan[t] = pbf_tan[coll_id];
+				collected_depth[t] = depths[coll_id];
+			}
+			block.sync();
+
+			for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+			{
+				// Sorted-ascending depth -> once exceeded, this point is done
+				// (no more relevant Gaussians can appear later in the list).
+				float gdepth = collected_depth[j];
+				if (gdepth > t_x)
+				{
+					done = true;
+					break;
+				}
+
+				float4 b_xxyy = collected_pbf_tan[j];
+				if (mode == 1) {
+					if (((rayf.x / rayf.z) < b_xxyy.x) || ((rayf.x / rayf.z) > b_xxyy.y))
+						continue;
+					if (((rayf.y / rayf.z) < b_xxyy.z) || ((rayf.y / rayf.z) > b_xxyy.w))
+						continue;
+				}
+
+				float3 xyz = collected_xyz[j];
+				float2 h_o = collected_h_opacity[j];
+				float3* w2o = collected_w2o + j * 3;
+
+				// see 3DGEER paper: https://openreview.net/pdf?id=4voMNlRWI7 (Eq. 5, mathmatical proof in Sec.B)
+				float3 p_obj = { dot(xyz, w2o[0]), dot(xyz, w2o[1]), dot(xyz, w2o[2]) };
+				float3 d_obj = { dot(rayf, w2o[0]), dot(rayf, w2o[1]), dot(rayf, w2o[2]) };
+				float3 normal = cross(d_obj, p_obj);
+				float power_mah = -0.5f * dot(normal, normal) / dot(d_obj, d_obj);
+
+				if (power_mah > 0.0f)
+					continue;
+
+				float alpha = min(0.99f, h_o.y * exp(power_mah));
+				if (alpha < 1.0f / 255.0f)
+					continue;
+
+				T *= (1.0f - alpha);
+			}
+		}
+
+		if (has_point)
+			out_alpha_integrated[qidx] = 1.0f - T;
+	}
+}
+
+void FORWARD::integrate(
+	const dim3 grid, dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int W, int H,
+	int mode,
+	float focal_x, float focal_y,
+	const float* tan_theta,
+	const float* tan_phi,
+	const float* raymap,
+	const float4* pbf_tan,
+	const float3* points_xyz_view,
+	const float2* h_opacity,
+	const float3* w2o,
+	const float* depths,
+	const int* q_pix_id,
+	const float* q_tval,
+	const uint2* q_ranges,
+	const uint32_t* q_point_order,
+	float* out_alpha_integrated)
+{
+	integrateCUDA<<<grid, block>>>(
+		ranges,
+		point_list,
+		W, H,
+		mode,
+		focal_x, focal_y,
+		tan_theta, tan_phi,
+		raymap,
+		pbf_tan,
+		points_xyz_view,
+		h_opacity,
+		w2o,
+		depths,
+		q_pix_id,
+		q_tval,
+		q_ranges,
+		q_point_order,
+		out_alpha_integrated);
+}
+
 void FORWARD::preprocess(int P, int D, int M,
 	const float* means3D,
 	const glm::vec3* scales,
