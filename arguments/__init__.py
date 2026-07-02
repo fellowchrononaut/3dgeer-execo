@@ -99,12 +99,18 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         # --- GaussianWrapping surface-alignment (GUTWrap Path A) ---
+        # Schedule follows the official GW config (configs/normal_field/default.yaml):
+        # normal field trains AFTER standard densification ends; wrapping runs as a
+        # few discrete rounds on the top error-quantile only.
         self.normal_lr = 0.001
         self.normal_weight = 0.05            # L_N weight
         self.depth_normal_weight = 0.05      # L_DN weight; 0.0 disables the 3rd render pass
-        self.normal_from_iter = 7000         # L_N/L_DN warm-up start
-        self.normal_error_threshold = 0.1    # wrapping-densification trigger (mean per-pixel error)
-        self.densify_and_wrap_from_iter = 7000
+        self.normal_from_iter = 20000        # L_N/L_DN start (GW: 20_001)
+        self.normal_error_threshold = 0.1    # floor on mean per-pixel error for wrapping
+        self.densify_and_wrap_from_iter = 22000   # GW: 22_000
+        self.densify_and_wrap_until_iter = 26000  # GW: 26_000
+        self.densify_and_wrap_interval = 1000     # GW: every 1_000
+        self.wrap_quantile = 0.05            # clone only the top 5% mean-error Gaussians (GW)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

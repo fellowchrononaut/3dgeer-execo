@@ -519,11 +519,22 @@ class GaussianModel:
 
         torch.cuda.empty_cache()
 
-    def densify_and_wrap(self, error_threshold):
+    def densify_and_wrap(self, error_threshold, quantile=0.05):
+        # GW official selection: only the top `quantile` fraction of touched
+        # Gaussians by mean error (configs/normal_field/default.yaml:
+        # densification_normal_errors_quantile), with `error_threshold` as an
+        # absolute floor. Prevents runaway cloning while normals converge.
         mean_err = torch.where(self.normal_error_count > 0,
                                self.normal_error_accum / self.normal_error_count,
                                torch.zeros_like(self.normal_error_accum))
-        high_error = mean_err > error_threshold
+        touched = self.normal_error_count > 0
+        n_touched = int(touched.sum().item())
+        if n_touched == 0:
+            return 0
+        k = max(1, int(quantile * n_touched))
+        cutoff = torch.topk(mean_err[touched], k, largest=True).values.min()
+        cutoff = torch.clamp(cutoff, min=error_threshold)
+        high_error = mean_err >= cutoff
         n = int(high_error.sum().item())
         if n == 0:
             return 0

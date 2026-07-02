@@ -207,6 +207,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 target_sv = (target_n_world.detach() * 0.5 + 0.5).permute(1, 2, 0).clamp(0, 1).cpu().numpy()
                 target_sv = (target_sv * 255).astype(np.uint8)
                 cv2.imwrite(os.path.join(dump_dir, f'iter_{iteration:06d}_target.png'), target_sv[:, :, [2, 1, 0]])
+                depth_sv = median_depth.detach().squeeze(0)
+                depth_sv = (depth_sv / depth_sv.max().clamp(min=1e-8)).clamp(0, 1).cpu().numpy()
+                depth_sv = (depth_sv * 255).astype(np.uint8)
+                cv2.imwrite(os.path.join(dump_dir, f'iter_{iteration:06d}_depth.png'), depth_sv)
 
         loss.backward()
 
@@ -248,16 +252,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
 
-                    if iteration > opt.densify_and_wrap_from_iter:
-                        n_wrapped = gaussians.densify_and_wrap(opt.normal_error_threshold)
-                        if n_wrapped > 0:
-                            print("[WRAP] iter {} cloned {}".format(iteration, n_wrapped))
-                        if tb_writer:
-                            tb_writer.add_scalar('wrapping/n_cloned', n_wrapped, iteration)
-                    gaussians.reset_normal_error_stats()
-
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
+            # Wrapping densification (GW schedule: discrete rounds after normal
+            # convergence, decoupled from the standard densification epochs).
+            if (iteration >= opt.densify_and_wrap_from_iter
+                    and iteration <= opt.densify_and_wrap_until_iter
+                    and iteration % opt.densify_and_wrap_interval == 0):
+                n_wrapped = gaussians.densify_and_wrap(opt.normal_error_threshold, opt.wrap_quantile)
+                print("[WRAP] iter {} cloned {}".format(iteration, n_wrapped))
+                if tb_writer:
+                    tb_writer.add_scalar('wrapping/n_cloned', n_wrapped, iteration)
+                gaussians.reset_normal_error_stats()
 
             # Optimizer step
             if iteration < opt.iterations:
