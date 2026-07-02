@@ -24,6 +24,8 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import numpy as np
 import cv2
+from utils.ray_normals import depth_to_normals_via_rays, view_normals_to_world
+from gaussian_renderer import render_normal_field
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -50,7 +52,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -65,6 +67,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    ema_LN_for_log = 0.0
 
     # Pre-compute viewer extra params so MiniCam uses the correct render mode.
     _render_model_map = {"BEAP": 0, "KB": 1, "EQ": 1, "PH": 2}
@@ -166,6 +169,45 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
+
+        # --- GW surface-alignment losses ---
+        L_N = torch.zeros((), device="cuda"); L_DN = torch.zeros((), device="cuda")
+        if iteration >= opt.normal_from_iter and opt.normal_weight > 0:
+            median_depth = render_pkg["median_depth"]            # (1,H,W), no grad path
+            with torch.no_grad():
+                target_n_view, valid = depth_to_normals_via_rays(viewpoint_cam, median_depth)
+                target_n_world = view_normals_to_world(viewpoint_cam, target_n_view)
+            normal_map = render_normal_field(viewpoint_cam, gaussians, pipe)   # (3,H,W) world
+            cos_N = (normal_map * target_n_world).sum(dim=0)
+            if valid.any():
+                L_N = (1.0 - cos_N[valid]).mean()
+                loss = loss + opt.normal_weight * L_N
+            if opt.depth_normal_weight > 0:
+                shape_map = render_normal_field(viewpoint_cam, gaussians, pipe, shape=True)
+                cos_DN = (shape_map * target_n_world).sum(dim=0)
+                if valid.any():
+                    L_DN = (1.0 - cos_DN[valid]).mean()
+                    loss = loss + opt.depth_normal_weight * L_DN
+            # online per-Gaussian error for wrapping densification
+            with torch.no_grad():
+                gidx = render_pkg["gidx"]                        # (H,W) int32, -1 = none
+                err = (1.0 - cos_N.detach()).clamp(min=0) * valid.float()
+                sel = gidx >= 0
+                if sel.any():
+                    ids = gidx[sel].long().flatten()
+                    gaussians.normal_error_accum.index_add_(0, ids, err[sel].flatten())
+                    gaussians.normal_error_count.index_add_(0, ids, torch.ones_like(ids, dtype=torch.float))
+
+            if iteration % 500 == 0:
+                dump_dir = os.path.join(scene.model_path, "normal_dumps")
+                os.makedirs(dump_dir, exist_ok=True)
+                render_sv = (normal_map.detach() * 0.5 + 0.5).permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+                render_sv = (render_sv * 255).astype(np.uint8)
+                cv2.imwrite(os.path.join(dump_dir, f'iter_{iteration:06d}_render.png'), render_sv[:, :, [2, 1, 0]])
+                target_sv = (target_n_world.detach() * 0.5 + 0.5).permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+                target_sv = (target_sv * 255).astype(np.uint8)
+                cv2.imwrite(os.path.join(dump_dir, f'iter_{iteration:06d}_target.png'), target_sv[:, :, [2, 1, 0]])
+
         loss.backward()
 
         iter_end.record()
@@ -174,14 +216,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
+            normals_active = iteration >= opt.normal_from_iter and opt.normal_weight > 0
+            if normals_active:
+                ema_LN_for_log = 0.4 * L_N.item() + 0.6 * ema_LN_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                postfix = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"}
+                if normals_active:
+                    postfix["L_N"] = f"{ema_LN_for_log:.{7}f}"
+                progress_bar.set_postfix(postfix)
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
+            if tb_writer and normals_active:
+                tb_writer.add_scalar('train_loss/L_N', L_N.item(), iteration)
+                tb_writer.add_scalar('train_loss/L_DN', L_DN.item(), iteration)
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), dataset.train_test_exp, valid_mask)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -196,7 +247,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                
+
+                    if iteration > opt.densify_and_wrap_from_iter:
+                        n_wrapped = gaussians.densify_and_wrap(opt.normal_error_threshold)
+                        if n_wrapped > 0:
+                            print("[WRAP] iter {} cloned {}".format(iteration, n_wrapped))
+                        if tb_writer:
+                            tb_writer.add_scalar('wrapping/n_cloned', n_wrapped, iteration)
+                    gaussians.reset_normal_error_stats()
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 

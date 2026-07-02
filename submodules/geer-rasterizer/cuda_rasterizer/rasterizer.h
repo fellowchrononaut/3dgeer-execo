@@ -58,6 +58,8 @@ namespace CudaRasterizer
 			float* kernel_times,
 			float* out_color,
 			float* depth,
+			float* out_median_depth,
+			int*   out_gidx,
 			bool antialiasing,
 			int mode,
 			int* radii = nullptr,

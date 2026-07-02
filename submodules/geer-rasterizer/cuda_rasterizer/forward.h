@@ -78,7 +78,9 @@ namespace FORWARD
 		const float* bg_color,
 		float* out_color,
 		float* depths,
-		float* depth);
+		float* depth,
+		float* out_median_depth,
+		int*   out_gidx);
 }
 
 #endif

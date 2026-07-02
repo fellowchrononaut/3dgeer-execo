@@ -32,7 +32,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -84,6 +84,9 @@ RasterizeGaussiansCUDA(
   out_invdepthptr = out_invdepth.data<float>();
 
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
+
+  torch::Tensor out_median_depth = torch::full({1, H, W}, 0.0, float_opts);
+  torch::Tensor out_gidx = torch::full({H, W}, -1, int_opts);
 
   // ranges for each tile
   dim3 tile_grid((image_width + BLOCK_X - 1) / BLOCK_X, (image_height + BLOCK_Y - 1) / BLOCK_Y, 1);
@@ -142,6 +145,8 @@ RasterizeGaussiansCUDA(
 		kernel_times.contiguous().data<float>(),
 		out_color.contiguous().data<float>(),
 		out_invdepthptr,
+		out_median_depth.contiguous().data<float>(),
+		out_gidx.contiguous().data<int>(),
 		antialiasing,
 		mode,
 		radii.contiguous().data<int>(),
@@ -150,7 +155,7 @@ RasterizeGaussiansCUDA(
 		debug,
 		asso_mode);
   }
-	return std::make_tuple(rendered, out_color, radii, kernel_times, range_len, geomBuffer, binningBuffer, imgBuffer, out_invdepth);
+	return std::make_tuple(rendered, out_color, radii, kernel_times, range_len, geomBuffer, binningBuffer, imgBuffer, out_invdepth, out_median_depth, out_gidx);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

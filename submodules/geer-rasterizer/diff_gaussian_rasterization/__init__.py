@@ -54,7 +54,8 @@ class _RasterizeGaussians(torch.autograd.Function):
     ):
         """Forward pass: rasterize 3D Gaussians into an image using the GEER algorithm.
 
-        Returns (color [C,H,W], radii [P], invdepth [1,H,W], kernel_times [5], tile_ranges [T]).
+        Returns (color [C,H,W], radii [P], invdepth [1,H,W], kernel_times [5], tile_ranges [T],
+        median_depth [1,H,W], gidx [H,W]).
         """
 
         # Restructure arguments the way that the C++ lib expects them
@@ -91,20 +92,22 @@ class _RasterizeGaussians(torch.autograd.Function):
         )
 
         # Invoke C++/CUDA rasterizer
-        num_rendered, color, radii, kernel_times, ranges, geomBuffer, binningBuffer, imgBuffer, invdepths = _C.rasterize_gaussians(*args) # ranges for each tile
+        num_rendered, color, radii, kernel_times, ranges, geomBuffer, binningBuffer, imgBuffer, invdepths, median_depth, gidx = _C.rasterize_gaussians(*args) # ranges for each tile
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, radii, sh, opacities, geomBuffer, binningBuffer, imgBuffer)
-        return color, radii, invdepths, kernel_times, ranges
+        ctx.mark_non_differentiable(radii, median_depth, gidx)
+        return color, radii, invdepths, kernel_times, ranges, median_depth, gidx
 
     @staticmethod
-    def backward(ctx, grad_out_color, grad_radii, grad_out_depth, grad_kernel_times, grad_ranges):
+    def backward(ctx, grad_out_color, grad_radii, grad_out_depth, grad_kernel_times, grad_ranges, grad_median_depth, grad_gidx):
         """Backward pass: propagate gradients from pixel loss to Gaussian parameters.
 
         Inputs grad_out_color [C,H,W] and grad_out_depth [1,H,W]; grad_radii,
-        grad_kernel_times, and grad_ranges are unused (non-differentiable outputs).
+        grad_kernel_times, grad_ranges, grad_median_depth, and grad_gidx are unused
+        (non-differentiable outputs).
         Returns gradients for (means3D, means2D, sh, colors_precomp, opacities, scales, rotations, None).
         """
 

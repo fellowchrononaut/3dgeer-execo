@@ -14,8 +14,9 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+from utils.general_utils import build_rotation
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, use_trained_exp=False, near_threshold=0.2, asso_mode=0):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, use_trained_exp=False, near_threshold=0.2, asso_mode=0, clamp_output=True):
     """
     Render the scene. 
     
@@ -117,7 +118,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
-    rendered_image, radii, depth_image, kernel_times, ranges = rasterizer(
+    rendered_image, radii, depth_image, kernel_times, ranges, median_depth, gidx = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -134,7 +135,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    rendered_image = rendered_image.clamp(0, 1)
+    rendered_image = rendered_image.clamp(0, 1) if clamp_output else rendered_image
     out = {
         "render": rendered_image,
         "viewspace_points": screenspace_points,
@@ -142,7 +143,28 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "radii": radii,
         "depth" : depth_image,
         "range_len": ranges,  # ranges for each tile
-        "time": kernel_times
+        "time": kernel_times,
+        "median_depth": median_depth,
+        "gidx": gidx,
         }
-    
+
     return out
+
+
+def render_normal_field(viewpoint_camera, pc : GaussianModel, pipe, shape=False):
+    """Render Sigma w*n as a 3-channel image via colors_precomp. World-space.
+    Encoded as (n+1)/2 with 0.5-gray background so empty pixels decode to 0.
+    (ported/adapted from GaussianWrapping densification/normal_error.py)
+    """
+    if shape:
+        R = build_rotation(pc.get_rotation)                     # (P,3,3) differentiable
+        axis = pc.get_scaling.argmin(dim=1)                     # non-diff selection (detached)
+        n = R[torch.arange(R.shape[0]), :, axis]                # (P,3) smallest-axis direction
+        sign = torch.sign((n.detach() * pc.get_normals.detach()).sum(-1, keepdim=True))
+        n = n * torch.where(sign == 0, torch.ones_like(sign), sign)
+    else:
+        n = pc.get_normals
+    bg = torch.full((3,), 0.5, device="cuda")
+    pkg = render(viewpoint_camera, pc, pipe, bg,
+                 override_color=(n + 1.0) * 0.5, clamp_output=False)
+    return pkg["render"] * 2.0 - 1.0                            # (3,H,W) world-space, unnormalized

@@ -273,6 +273,8 @@ int CudaRasterizer::Rasterizer::forward(
 	float* kernel_times,
 	float* out_color,
 	float* depth,
+	float* out_median_depth,
+	int*   out_gidx,
 	bool antialiasing,
 	const int mode,
 	int* radii,
@@ -471,7 +473,9 @@ int CudaRasterizer::Rasterizer::forward(
 		background,
 		out_color,
 		geomState.depths,
-		depth), debug)
+		depth,
+		out_median_depth,
+		out_gidx), debug)
 
 	cudaEventRecord(overallStop, 0);
 	cudaEventSynchronize(overallStop);

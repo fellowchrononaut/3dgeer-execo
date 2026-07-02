@@ -988,7 +988,9 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
 	const float* __restrict__ depths,
-	float* __restrict__ invdepth
+	float* __restrict__ invdepth,
+	float* __restrict__ out_median_depth,   // [H*W] Euclidean dist where T crosses 0.5; 0 = never crossed
+	int*   __restrict__ out_gidx            // [H*W] Gaussian id that drove the crossing; -1 = none
 )
 {
 	// Identify current tile and associated min/max pixel range.
@@ -1106,6 +1108,15 @@ renderCUDA(
 				continue;
 			}
 
+			// Median (0.5-transmittance) depth + owning Gaussian id.
+			// p_obj/d_obj are the canonical-frame ray quantities (Eq.5);
+			// the closest-point parameter t* along rayf is frame-invariant.
+			if (out_median_depth != nullptr && T > 0.5f && test_T <= 0.5f) {
+				float t_star = dot(p_obj, d_obj) / dot(d_obj, d_obj);
+				out_median_depth[pix_id] = t_star * sqrtf(dot(rayf, rayf));
+				out_gidx[pix_id] = collected_id[j];
+			}
+
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
@@ -1154,7 +1165,9 @@ void FORWARD::render(
 	const float* bg_color,
 	float* out_color,
 	float* depths,
-	float* depth)
+	float* depth,
+	float* out_median_depth,
+	int*   out_gidx)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -1173,8 +1186,10 @@ void FORWARD::render(
 		n_contrib,
 		bg_color,
 		out_color,
-		depths, 
-		depth);
+		depths,
+		depth,
+		out_median_depth,
+		out_gidx);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
