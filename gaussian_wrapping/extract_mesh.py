@@ -86,11 +86,23 @@ def main():
     parser.add_argument("--n_binary_steps", type=int, default=10)
     # -- Session E2: exact ray-integrated occupancy field --------------------
     parser.add_argument("--sdf_mode", type=str, default="integrated",
-                         choices=["integrated", "tsdf"],
-                         help="'integrated' = exact ray-integrated occupancy "
+                         choices=["integrated", "exact", "tsdf"],
+                         help="'integrated' = continuous ray-integrated occupancy "
                               "(GW's quality path, forward-only CUDA integrate "
-                              "kernel); 'tsdf' = Session E depth-fusion field "
-                              "(fast preview).")
+                              "kernel); 'exact' = GW's exact_computation mode "
+                              "(SAME integrate kernel, binary +-0.5 field via "
+                              "transmittance thresholding); 'tsdf' = Session E "
+                              "depth-fusion field (fast preview).")
+    # -- Session E3: GW parity options -----------------------------------
+    parser.add_argument("--auto_iso", action="store_true",
+                         help="Port of GW's compute_automatically_isosurface_value: "
+                              "sample surface points from rendered median-depth maps, "
+                              "evaluate the field there, and set --iso automatically so "
+                              "those points sit at the isosurface. Only valid for "
+                              "--sdf_mode {integrated,exact}. Overrides --iso.")
+    parser.add_argument("--auto_iso_n_points", type=int, default=1_000_000)
+    parser.add_argument("--auto_iso_reduction", type=str, default="median",
+                         choices=["median", "mean"])
     parser.add_argument("--use_searched_pivots", type=str, default=None,
                          choices=["on", "off"],
                          help="Walk each front pivot outward along the normal "
@@ -153,6 +165,9 @@ def main():
         search_iter=args.search_iter,
         search_step_size=args.search_step_size,
         max_field_eval_sec=args.max_field_eval_sec,
+        auto_iso=args.auto_iso,
+        auto_iso_n_points=args.auto_iso_n_points,
+        auto_iso_reduction=args.auto_iso_reduction,
         stats_path=stats_path,
     )
 

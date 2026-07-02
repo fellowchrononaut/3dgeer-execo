@@ -29,7 +29,10 @@ import trimesh
 from scipy.spatial import Delaunay
 
 from gaussian_wrapping.pivots import extract_gaussian_pivots, get_searched_pivots
-from gaussian_wrapping.fields import render_depth_maps, fuse_tsdf_at_points, evaluate_occupancy_integrated
+from gaussian_wrapping.fields import (
+    render_depth_maps, fuse_tsdf_at_points, evaluate_occupancy_integrated,
+    sample_depth_surface_points,
+)
 
 # ---------------------------------------------------------------------------
 # Marching tetrahedra (ported from GaussianWrapping utils/tetmesh.py, which is
@@ -263,6 +266,9 @@ def extract_mesh_pivot_mtet(
     search_step_size: float = 0.33,
     field_chunk: Optional[int] = None,
     max_field_eval_sec: float = 180.0,
+    auto_iso: bool = False,
+    auto_iso_n_points: int = 1_000_000,
+    auto_iso_reduction: str = "median",
     stats_path: Optional[str] = None,
 ):
     """Full pivot-based marching-tetrahedra pipeline. Returns a dict of
@@ -274,6 +280,21 @@ def extract_mesh_pivot_mtet(
             `integrate_points` CUDA kernel, see gaussian_wrapping/fields.py::
             evaluate_occupancy_integrated) or "tsdf" (Session E's
             depth-fusion field, kept as the fast preview mode).
+
+    Args (Session E3 additions):
+        sdf_mode: also accepts "exact" -- GW's `exact_computation` mode
+            (binary +-0.5 field from the SAME per-view integrated alphas as
+            "integrated", see fields.py::evaluate_occupancy_integrated
+            mode="exact").
+        auto_iso: port of GW's `compute_automatically_isosurface_value`
+            (only valid for sdf_mode in {"integrated","exact"}): samples
+            world-space surface points from rendered median-depth maps,
+            evaluates the (iso=0) field there, and OVERRIDES `iso` so those
+            surface points sit at field==0 on average. Prints + stores the
+            computed value in stats["iso"] / stats["auto_iso_sdf_isosurface_value"].
+        auto_iso_n_points / auto_iso_reduction: sampling budget ("median" or
+            "mean" reduction over the per-point field values), see GW's
+            `compute_isosurface_value_from_depth`.
         use_searched_pivots: if True, pivots are refined via
             `pivots.get_searched_pivots` (walks the front pivot outward
             along the normal until it crosses the surface) instead of the
@@ -330,6 +351,13 @@ def extract_mesh_pivot_mtet(
     # -- field callable (used for pivot evaluation AND binary-search
     #    refinement below) -----------------------------------------------
     if sdf_mode == "tsdf":
+        if auto_iso:
+            raise ValueError(
+                "--auto_iso is only supported for --sdf_mode {integrated,exact} "
+                "(GW's TSDF depth-fusion field is only their pivot-initialization "
+                "helper -- not the field compute_automatically_isosurface_value "
+                "targets in GW's own pipeline either)."
+            )
         t0 = time.time()
         depth_maps = render_depth_maps(cameras, gaussians, pipe)
         stats["t_render_depth_sec"] = time.time() - t0
@@ -338,38 +366,88 @@ def extract_mesh_pivot_mtet(
         tsdf_chunk = field_chunk if field_chunk is not None else 500_000
         field_fn = lambda pts: fuse_tsdf_at_points(pts, cameras, depth_maps, trunc_margin, chunk_size=tsdf_chunk)
         field_fn_refine = field_fn
+        field_includes_iso = False
         if use_searched_pivots is None:
             use_searched_pivots = False
-    elif sdf_mode == "integrated":
+    elif sdf_mode in ("integrated", "exact"):
+        # Session E3: "exact" reuses the SAME per-view integrated-alpha pass as
+        # "integrated" (evaluate_occupancy_integrated); only the pooling/
+        # threshold at the end differs (mode="exact" -> binary +-0.5 field
+        # instead of the continuous 0.5+iso-occupancy field). See fields.py.
+        occ_mode = "exact" if sdf_mode == "exact" else "integrated"
         integrated_chunk = field_chunk if field_chunk is not None else 2_000_000
-        field_fn = lambda pts: evaluate_occupancy_integrated(
-            pts, cameras, gaussians, pipe, iso=0.0, chunk=integrated_chunk)
+
+        def _make_field_fn(iso_value, camera_list):
+            return lambda pts: evaluate_occupancy_integrated(
+                pts, camera_list, gaussians, pipe, iso=iso_value, chunk=integrated_chunk, mode=occ_mode)
+
         if use_searched_pivots is None:
             use_searched_pivots = True
 
         # Calibrate on a modest, representative sample (post radius-crop
         # Gaussian centers) to decide whether the (many-call) search/refine
-        # stages should subsample views to stay within budget. The final
-        # pivot-SDF eval below always uses the full camera set.
+        # stages (and the auto-iso depth-surface eval below) should
+        # subsample views to stay within budget. The final pivot-SDF eval
+        # below always uses the full camera set.
+        field_fn_iso0 = _make_field_fn(0.0, cameras)
         t0 = time.time()
         calib_n = min(50_000, means.shape[0])
-        _ = field_fn(means[:calib_n])
+        _ = field_fn_iso0(means[:calib_n])
         stats["t_field_eval_calibration_sec"] = time.time() - t0
         if stats["t_field_eval_calibration_sec"] > max_field_eval_sec and len(cameras) > 4:
             refine_cameras = cameras[::2]
-            field_fn_refine = lambda pts: evaluate_occupancy_integrated(
-                pts, refine_cameras, gaussians, pipe, iso=0.0, chunk=integrated_chunk)
             stats["refine_view_subsampled"] = True
             print(f"[mesh_extraction] field eval on {calib_n} pts took "
                   f"{stats['t_field_eval_calibration_sec']:.1f}s > {max_field_eval_sec:.0f}s budget -- "
                   f"subsampling views ({len(refine_cameras)}/{len(cameras)}) for search/refine stages")
         else:
-            field_fn_refine = field_fn
+            refine_cameras = cameras
             stats["refine_view_subsampled"] = False
+
+        # -- Session E3: --auto_iso -- port of GW's
+        #    compute_automatically_isosurface_value: sample world-space
+        #    surface points from rendered median-depth maps, evaluate the
+        #    (iso=0) field there, and set iso so those surface points sit at
+        #    field==0 on average. Overrides the `iso` argument. NOTE: this
+        #    also fixes a latent bug in the pre-Session-E3 code, where
+        #    field_fn/field_fn_refine always hardcoded iso=0.0 and a
+        #    non-zero `iso` argument was only applied by subtracting it
+        #    later (inconsistently: applied to the pivot/mtet sdf and to the
+        #    binary-search *endpoints*, but NOT to field_fn_refine's own
+        #    re-evaluations inside the bisection loop). Baking `iso` into
+        #    the field itself (as GW does: `sdf_function(x) -
+        #    isosurface_value` computed once, reused everywhere) is
+        #    bit-identical to the old code when iso==0.0 (the default), so
+        #    this is not a regression.
+        if auto_iso:
+            t0 = time.time()
+            surface_pts = sample_depth_surface_points(
+                cameras, gaussians, pipe, n_points=auto_iso_n_points)
+            raw_field_at_surface = field_fn_iso0(surface_pts)
+            if auto_iso_reduction == "median":
+                sdf_isosurface_value = raw_field_at_surface.median().item()
+            elif auto_iso_reduction == "mean":
+                sdf_isosurface_value = raw_field_at_surface.mean().item()
+            else:
+                raise ValueError(f"Unknown auto_iso_reduction: {auto_iso_reduction!r}")
+            iso = -sdf_isosurface_value
+            stats["t_auto_iso_sec"] = time.time() - t0
+            stats["auto_iso_n_surface_points"] = int(surface_pts.shape[0])
+            stats["auto_iso_reduction"] = auto_iso_reduction
+            stats["auto_iso_sdf_isosurface_value"] = sdf_isosurface_value
+            print(f"[mesh_extraction] auto_iso: sampled {surface_pts.shape[0]} depth-surface "
+                  f"points, {auto_iso_reduction} raw field = {sdf_isosurface_value:.6f} "
+                  f"-> using iso = {iso:.6f}")
+
+        field_fn = _make_field_fn(iso, cameras)
+        field_fn_refine = _make_field_fn(iso, refine_cameras) if stats["refine_view_subsampled"] else field_fn
+        field_includes_iso = True
     else:
-        raise ValueError(f"Unknown sdf_mode: {sdf_mode!r} (expected 'integrated' or 'tsdf')")
+        raise ValueError(f"Unknown sdf_mode: {sdf_mode!r} (expected 'integrated', 'exact', or 'tsdf')")
     stats["sdf_mode"] = sdf_mode
     stats["use_searched_pivots"] = use_searched_pivots
+    stats["auto_iso"] = auto_iso
+    stats["iso"] = iso
 
     if use_searched_pivots:
         pivots, pivot_scales = get_searched_pivots(
@@ -439,8 +517,9 @@ def extract_mesh_pivot_mtet(
 
     # -- 4. Marching tetrahedra ----------------------------------------------
     t0 = time.time()
+    mtet_sdf = pivot_sdf if field_includes_iso else (pivot_sdf - iso)
     end_points, end_sdf, end_scales, faces, edge_pivot_idx = marching_tetrahedra(
-        vertices=pivots, tets=tets, sdf=(pivot_sdf - iso), scales=pivot_scales,
+        vertices=pivots, tets=tets, sdf=mtet_sdf, scales=pivot_scales,
     )
     stats["t_mtet_sec"] = time.time() - t0
     stats["n_raw_triangles"] = int(faces.shape[0])
@@ -467,8 +546,9 @@ def extract_mesh_pivot_mtet(
     # -- 5. Binary-search refinement ------------------------------------------
     t0 = time.time()
     if n_binary_steps > 0:
+        refine_sdf = end_sdf if field_includes_iso else (end_sdf - iso)
         verts = _binary_search_refine(
-            end_points, end_sdf - iso, field_fn_refine, n_steps=n_binary_steps,
+            end_points, refine_sdf, field_fn_refine, n_steps=n_binary_steps,
         )
     else:
         verts = verts_linear

@@ -56,6 +56,21 @@ def world_to_view(camera, points: torch.Tensor) -> torch.Tensor:
     return view_points[:, :3]
 
 
+def view_to_world(camera, points_view: torch.Tensor) -> torch.Tensor:
+    """Inverse of `world_to_view`: this camera's view-space (N,3) -> world-space
+    (N,3). Algebraic inverse of the same row-vector convention (`points_h @
+    world_view_transform`), used by the Session E3 `--auto_iso` depth-surface
+    sampling (`sample_depth_surface_points` below) -- GaussianWrapping's
+    `compute_automatically_isosurface_value` needs to turn rendered median-depth
+    pixels (view-space) back into world-space query points for the field."""
+    ones = torch.ones(points_view.shape[0], 1, device=points_view.device, dtype=points_view.dtype)
+    points_h = torch.cat([points_view, ones], dim=-1)  # (N,4)
+    wvt = camera.world_view_transform.to(device=points_view.device, dtype=points_view.dtype)
+    wvt_inv = torch.inverse(wvt)
+    world_points = points_h @ wvt_inv
+    return world_points[:, :3]
+
+
 @torch.no_grad()
 def render_depth_maps(cameras: List, gaussians, pipe) -> List[torch.Tensor]:
     """Render and return the median_depth map (1,H,W) for each camera.
@@ -75,6 +90,49 @@ def render_depth_maps(cameras: List, gaussians, pipe) -> List[torch.Tensor]:
             pkg = render(cam, gaussians, pipe, background)
         depth_maps.append(pkg["median_depth"].detach())
     return depth_maps
+
+
+@torch.no_grad()
+def sample_depth_surface_points(
+    cameras: List, gaussians, pipe, n_points: int = 1_000_000,
+) -> torch.Tensor:
+    """Sample world-space surface points from rendered median-depth maps.
+
+    ported/adapted from GaussianWrapping pivot_based_mesh_extraction.py's
+    `compute_automatically_isosurface_value` depth-point sampling (which uses
+    `utils.geometry_utils.depths_to_points`, pinhole-only) -- reimplemented
+    here on top of 3DGEER's own `median_depth` render output and the
+    render-model-aware ray directions from `utils/ray_normals.py::
+    get_ray_dirs_view` (PH analytic rays / KB-EQ raymap), so it works for
+    both camera models Session E3 needs to support.
+
+    Roughly `n_points // len(cameras)` valid (depth > 0) pixels are sampled
+    per camera and unprojected to world space via `view_to_world`.
+    """
+    from utils.ray_normals import get_ray_dirs_view
+
+    depth_maps = render_depth_maps(cameras, gaussians, pipe)
+    n_per_cam = max(1, n_points // max(1, len(cameras)))
+    all_pts = []
+    for cam, dmap in zip(cameras, depth_maps):
+        dirs = get_ray_dirs_view(cam)  # (3,H,W)
+        d = dmap.to(device=dirs.device, dtype=dirs.dtype).view(1, dirs.shape[1], dirs.shape[2])
+        pts_view = (dirs * d).permute(1, 2, 0).reshape(-1, 3)  # (H*W,3)
+        valid = (d.view(-1) > 0)
+        idx = valid.nonzero(as_tuple=True)[0]
+        if idx.numel() == 0:
+            continue
+        if idx.numel() > n_per_cam:
+            perm = torch.randperm(idx.numel(), device=idx.device)[:n_per_cam]
+            idx = idx[perm]
+        all_pts.append(view_to_world(cam, pts_view[idx]))
+
+    if len(all_pts) == 0:
+        raise RuntimeError(
+            "sample_depth_surface_points: no camera produced a valid median-depth "
+            "pixel (all median_depth maps were all-zero)."
+        )
+    return torch.cat(all_pts, dim=0)
 
 
 def fuse_tsdf_at_points(
@@ -277,15 +335,31 @@ def evaluate_occupancy_integrated(
     pipe,
     iso: float = 0.0,
     chunk: int = 2_000_000,
+    mode: str = "integrated",
 ) -> torch.Tensor:
     """Exact ray-integrated occupancy field at `points` (N,3) world-space.
 
     One forward render (buffer build) per camera (cannot cache all views'
     8M-Gaussian state at once); each point chunk within that view reuses the
     same buffers. occupancy(x) = min over valid views of A_v(x); points
-    valid in no view get occupancy 0 (vacant). Returns field = 0.5 + iso -
-    occupancy (SAME sign convention as fuse_tsdf_at_points: >0 empty, <0
-    occupied, surface at 0).
+    valid in no view get occupancy 0 (vacant).
+
+    Args:
+        mode: "integrated" (default, bit-identical to the pre-Session-E3
+            behavior) returns the continuous field 0.5 + iso - occupancy
+            (SAME sign convention as fuse_tsdf_at_points: >0 empty, <0
+            occupied, surface at 0). "exact" ports GaussianWrapping's
+            `exact_computation` mode (pivot_based_mesh_extraction.py:181-207,
+            `evaluate_vacancy_sof_fast` + `transmittance_threshold`): reuses
+            the SAME per-view A_v(x) computed above, but instead of pooling
+            them into a continuous field, thresholds directly -- a point is
+            vacant iff some view observes it with transmittance
+            `1 - A_v(x) > 0.5 + iso`, i.e. iff `occupancy(x) = min_v A_v(x) <
+            0.5 - iso` -- and returns a BINARY field: +0.5 where vacant,
+            -0.5 where occupied (same >0 empty / <0 occupied / surface-at-0
+            sign convention, just saturated to +-0.5 instead of continuous).
+            No new CUDA: same integrate_points kernel, only the
+            pooling/threshold step differs.
     """
     assert points.shape[-1] == 3
     N = points.shape[0]
@@ -313,4 +387,11 @@ def evaluate_occupancy_integrated(
             any_valid[start:end] = valid_prev | valid
 
     occupancy = torch.where(any_valid, occupancy, torch.zeros_like(occupancy))
-    return 0.5 + iso - occupancy
+
+    if mode == "integrated":
+        return 0.5 + iso - occupancy
+    elif mode == "exact":
+        vacant = occupancy < (0.5 - iso)
+        return torch.where(vacant, torch.full_like(occupancy, 0.5), torch.full_like(occupancy, -0.5))
+    else:
+        raise ValueError(f"Unknown mode: {mode!r} (expected 'integrated' or 'exact')")
