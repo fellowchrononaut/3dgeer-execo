@@ -25,16 +25,24 @@ rule: document semantic gaps in this header):
 
 1. **Gradient field**: GW's Newton-step direction comes from their own
    analytic Gaussian-mixture log-density gradient (`GaussianVectorField` /
-   `utils/primal_adaptive_meshing_utils.py::get_vector_field_quantities_aux`),
-   which needs GW-specific `GaussianModel` machinery we don't have
-   (`convert_features_to_normals`, `get_scaling_with_3D_filter`,
-   `learn_occupancy` opacity-shift mode, ...). The task spec explicitly asks
-   for refinement "using our field callable"; this port therefore replaces
-   GW's analytic vector field with a **central-difference numerical gradient
-   of our own field_fn** (`pam_utils.numerical_field_gradient`, same field_fn
-   as `mesh_extraction.py --sdf_mode {integrated,exact}`). This costs 6 extra
-   field evaluations per refinement step (vs. GW's ~0, since theirs is a
-   closed-form KNN lookup) but requires zero new Gaussian-model machinery.
+   `utils/primal_adaptive_meshing_utils.py::get_vector_field_quantities_aux`).
+   This was originally replaced with a **central-difference numerical
+   gradient of our own field_fn** (`pam_utils.numerical_field_gradient`,
+   still the default via `--gradient_mode numerical`), on the assumption
+   that GW's analytic path needed GW-specific `GaussianModel` machinery we
+   didn't have. That assumption turned out to be false: our own
+   `GaussianModel` already exposes activated/normalized
+   `get_xyz`/`get_normals`/`get_scaling`/`get_rotation`/`get_opacity`
+   accessors, which is all the analytic gradient needs -- no
+   `_with_3D_filter` mip-filter variants required. We since diagnosed the
+   numerical gradient as the root cause of PAM's fragmentation blowup (it
+   differentiates a *rendered* field, inheriting that field's per-view
+   nearest-pixel-binning discretization), so the analytic path is now ported
+   and available via `--gradient_mode analytic`
+   (`pam_utils.GaussianVectorField`, a KD-tree k-NN lookup over raw Gaussian
+   centers -- zero cameras, zero rasterization). See `pam_utils.py`'s module
+   docstring and `tests/test_pam_analytic_gradient.py` (empirical sign-
+   convention verification) for the full story.
 2. **Sign/threshold convention**: GW works in an "occupancy in [0,1],
    threshold ~0.5" convention with a separate `iso_surface_value` /
    `occupancy_threshold` algebra layer. This port instead works directly in
@@ -90,7 +98,7 @@ from gaussian_wrapping.extract_mesh import build_scene  # noqa: E402
 from gaussian_wrapping.fields import evaluate_occupancy_integrated, sample_depth_surface_points  # noqa: E402
 from gaussian_wrapping.mesh_extraction import _largest_connected_component  # noqa: E402
 from gaussian_wrapping.pam_utils import (  # noqa: E402
-    MeshFromDelaunay, TorchMesh, numerical_field_gradient,
+    GaussianVectorField, MeshFromDelaunay, TorchMesh, numerical_field_gradient,
     sample_mesh_proportional_to_camera, sample_surface_even, plot_histogram,
 )
 
@@ -272,10 +280,24 @@ def main():
                               "always uses the full camera set.")
     parser.add_argument("--grad_eps", type=float, default=None,
                          help="Absolute world-space step for the central-difference field gradient "
-                              "used by refinement (default: 0.002 * scene_radius).")
+                              "used by refinement (default: 0.002 * scene_radius). Only used when "
+                              "--gradient_mode numerical.")
     parser.add_argument("--min_grad_norm", type=float, default=1e-4,
                          help="Points with |grad field| below this are left in place during refinement "
-                              "(no reliable local surface direction).")
+                              "(no reliable local surface direction). NOTE: calibrated for the "
+                              "numerical gradient's units/scale -- see printed percentile diagnostic "
+                              "for --gradient_mode analytic, whose gradient has different magnitude.")
+    parser.add_argument("--gradient_mode", type=str, default="numerical", choices=["numerical", "analytic"],
+                         help="Newton-step gradient source for refinement. 'numerical': central-"
+                              "difference gradient of our own rendered field_fn (original port, "
+                              "inherits that field's per-view pixel-binning discretization noise). "
+                              "'analytic': GW's own closed-form Gaussian-mixture log-vacancy gradient "
+                              "(GaussianVectorField, KD-tree k-NN over raw Gaussian centers -- zero "
+                              "rendering) -- see pam_utils.py module docstring for why this fixes "
+                              "PAM's fragmentation blowup.")
+    parser.add_argument("--n_neighbors_vector_field", type=int, default=32,
+                         help="k for --gradient_mode analytic's KD-tree nearest-neighbor lookup "
+                              "(matches GW's own default).")
 
     parser.add_argument("--max_points", type=int, default=1_000_000, help="Target number of final candidate points")
     parser.add_argument("--p_per_tet", type=int, default=10, help="Points per tet for occupancy check (1 = tet barycenter)")
@@ -359,9 +381,33 @@ def main():
     field_fn = _make_field_fn(iso, cameras)                 # full-camera, for final occupancy/classification
     field_fn_refine = _make_field_fn(iso, refine_cameras)   # possibly view-subsampled, for the Newton loop
 
-    grad_eps = args.grad_eps if args.grad_eps is not None else 0.002 * scene_radius
-    stats["grad_eps"] = grad_eps
-    grad_fn_refine = lambda pts: numerical_field_gradient(field_fn_refine, pts, eps=grad_eps)  # noqa: E731
+    stats["gradient_mode"] = args.gradient_mode
+    if args.gradient_mode == "analytic":
+        vector_field = GaussianVectorField(gaussians, k_neighbors=args.n_neighbors_vector_field)
+        grad_fn_refine = lambda pts: vector_field.gradient(pts, gaussians)  # noqa: E731
+        # Sign convention verified empirically in tests/test_pam_analytic_gradient.py:
+        # GaussianVectorField's raw output is used as-is (no flip) -- see
+        # pam_utils.py's GaussianVectorField docstring for the full derivation.
+
+        # --min_grad_norm was calibrated for the numerical gradient's units/scale;
+        # the analytic gradient has a different magnitude, so print a quick
+        # calibration diagnostic to sanity-check the default isn't miscalibrated.
+        calib_grad = vector_field.gradient(calib_pts.to("cuda"), gaussians)
+        calib_norms = calib_grad.norm(dim=-1)
+        pct = torch.tensor([0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99], device=calib_norms.device)
+        qs = torch.quantile(calib_norms, pct).tolist()
+        stats["analytic_grad_norm_percentiles"] = dict(zip(["p1", "p5", "p25", "p50", "p75", "p95", "p99"], qs))
+        frac_below_min_grad_norm = (calib_norms < args.min_grad_norm).float().mean().item()
+        stats["analytic_frac_below_min_grad_norm"] = frac_below_min_grad_norm
+        print(f"[pam] analytic grad_fn calibration ({calib_norms.shape[0]} Gaussian-center points): "
+              f"|grad| percentiles p1={qs[0]:.4g} p5={qs[1]:.4g} p25={qs[2]:.4g} p50={qs[3]:.4g} "
+              f"p75={qs[4]:.4g} p95={qs[5]:.4g} p99={qs[6]:.4g}")
+        print(f"[pam] fraction of calibration points below --min_grad_norm={args.min_grad_norm:g}: "
+              f"{frac_below_min_grad_norm:.4f}")
+    else:
+        grad_eps = args.grad_eps if args.grad_eps is not None else 0.002 * scene_radius
+        stats["grad_eps"] = grad_eps
+        grad_fn_refine = lambda pts: numerical_field_gradient(field_fn_refine, pts, eps=grad_eps)  # noqa: E731
 
     # -- 4. load + crop input mesh -------------------------------------------
     t0 = time.time()

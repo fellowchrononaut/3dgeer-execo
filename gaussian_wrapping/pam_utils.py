@@ -2,13 +2,34 @@
 """Support utilities for gaussian_wrapping/pam_extraction.py (Session E3 PAM
 port): the Delaunay-tet mesh container (`MeshFromDelaunay`, pure numpy/scipy,
 ported near-verbatim), camera-aware surface sampling
-(`sample_mesh_proportional_to_camera`), and a numerical-gradient substitute
-for GW's analytic `GaussianVectorField` (see pam_extraction.py's module
-docstring, deviation #1, for why).
+(`sample_mesh_proportional_to_camera`), a numerical-gradient fallback for
+Newton refinement (`numerical_field_gradient`, still used by
+`--gradient_mode numerical`), and -- as of the Session E3 PAM-noise fix --
+GW's own **analytic** Newton-step gradient (`GaussianVectorField` /
+`get_vector_field_quantities_aux` / `robust_sigma_inv` /
+`robust_gaussian_eval_shifted_points`, `--gradient_mode analytic`).
 
-NOT ported from the GW file: `GaussianVectorField` / `get_vector_field_
-quantities_aux` (needs GW-specific GaussianModel attributes we don't have --
-see pam_extraction.py header) and `plot_histogram`'s exact styling (kept, but
+This analytic path was originally skipped (see pam_extraction.py's old
+deviation #1) because it was judged to need GW-specific `GaussianModel`
+machinery we didn't have. We since diagnosed that PAM's noisiest failure mode
+(median dihedral 24 deg but component count 6x the raw mesh's, on the truck
+checkpoint) traces to `numerical_field_gradient` differentiating our own
+*rendered* occupancy field, which inherits that field's per-view
+nearest-pixel binning discretization (`fields.py`'s `.round()` lookup, not
+bilinear) -- a numerical artifact, not a real surface feature. GW's analytic
+gradient sidesteps this entirely: it is a closed-form Gaussian-mixture
+log-vacancy gradient computed from a KD-tree k=32-nearest-Gaussian lookup
+(by center), using ONLY each Gaussian's own mean/normal/scaling/rotation/
+opacity -- zero cameras, zero rasterization, zero pixel binning anywhere. We
+now have all of those accessors (`gaussians.get_xyz/get_normals/get_scaling/
+get_rotation/get_opacity`, all already activated/normalized) with no GW-style
+mip-filter (`_with_3D_filter`) variants needed, so the port is tractable
+without any new GaussianModel machinery. It is a paired-but-mismatched
+scalar/gradient Newton scheme (GW's own comment: "Non normalized normal
+field is grad log v") -- a production-proven heuristic, not an exact
+gradient of our own occupancy scalar -- ported faithfully as-is.
+
+NOT ported from the GW file: `plot_histogram`'s exact styling (kept, but
 trivial/optional -- see below).
 """
 import os
@@ -16,10 +37,11 @@ from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import torch
-from scipy.spatial import Delaunay
+from scipy.spatial import Delaunay, KDTree
 
 from gaussian_wrapping.fields import world_to_view
 from gaussian_wrapping.fisheye_proj import project_view_to_pixel
+from utils.general_utils import build_scaling_rotation
 
 # ---------------------------------------------------------------------------
 # MeshFromDelaunay (verbatim port -- pure numpy/scipy, no GW renderer deps)
@@ -151,6 +173,160 @@ def numerical_field_gradient(field_fn: Callable, points: torch.Tensor, eps: floa
         f_minus = field_fn(points - offset)
         grads[:, axis] = (f_plus - f_minus) / (2.0 * eps)
     return grads
+
+
+# ---------------------------------------------------------------------------
+# Analytic Newton-step gradient (GW's GaussianVectorField, ported verbatim --
+# see module docstring above for why this is now tractable / what it is).
+# Ported from GW utils/general_utils.py::robust_sigma_inv,
+# robust_gaussian_eval_shifted_points (lines ~147-214) and
+# utils/primal_adaptive_meshing_utils.py::get_vector_field_quantities_aux,
+# GaussianVectorField (lines ~179-291), variable names adapted only.
+# ---------------------------------------------------------------------------
+
+def robust_sigma_inv(g_scales: torch.Tensor, g_rotation: torch.Tensor,
+                      return_invscale_rot: bool = False):
+    """Inverse covariance Sigma^-1 = (S^-1 R^T)^T (S^-1 R^T) for an
+    anisotropic Gaussian, given per-Gaussian scale/rotation. Accepts
+    (N,3)/(N,4) or batched (B,k,3)/(B,k,4) inputs (ported verbatim from GW's
+    utils/general_utils.py::robust_sigma_inv, using OUR
+    `build_scaling_rotation` -- identical implementation already in
+    utils/general_utils.py).
+
+    NOTE (verbatim from GW): uses `.view()`, not `.reshape()` -- callers must
+    pass contiguous (N,3)/(N,4) or (B,k,3)/(B,k,4) tensors (true for
+    `GaussianVectorField`'s fancy-indexed gather below; test code building
+    synthetic batches should `.repeat()`/`.contiguous()`, not `.expand()`).
+    """
+    using_batches = g_scales.ndim == 3
+    if using_batches:
+        B, k, _ = g_scales.shape
+        g_scales = g_scales.view(-1, 3)
+        g_rotation = g_rotation.view(-1, 4)
+    M = build_scaling_rotation(s=1.0 / g_scales, r=g_rotation).transpose(-1, -2)  # (..., 3, 3)
+    sigma_inv = M.transpose(-1, -2) @ M  # (..., 3, 3)
+    if using_batches:
+        sigma_inv = sigma_inv.view(B, k, 3, 3)
+        M = M.view(B, k, 3, 3)
+    if return_invscale_rot:
+        return sigma_inv, M
+    return sigma_inv
+
+
+def robust_gaussian_eval_shifted_points(shifted_points: torch.Tensor,
+                                         gaussian_invscale_rot: torch.Tensor,
+                                         gaussian_opacity: torch.Tensor) -> torch.Tensor:
+    """Numerically-stable anisotropic Gaussian density eval at points already
+    shifted by (x - mu). (N,3),(N,3,3),(N,1) -> (N,1). Ported verbatim from
+    GW's utils/general_utils.py::robust_gaussian_eval_shifted_points."""
+    transformed_shifts = torch.bmm(
+        gaussian_invscale_rot,             # (N, 3, 3)
+        shifted_points.unsqueeze(-1),      # (N, 3, 1)
+    ).squeeze(-1)                          # (N, 3)
+    dist_sq = (transformed_shifts ** 2).sum(dim=-1, keepdim=True)  # (N, 1)
+    gaussian_density = gaussian_opacity * torch.exp(-0.5 * dist_sq)  # (N, 1)
+    return gaussian_density
+
+
+def get_vector_field_quantities_aux(points: torch.Tensor, g_means: torch.Tensor,
+                                     g_normals: torch.Tensor, g_scales: torch.Tensor,
+                                     g_rotation: torch.Tensor, g_opacity: torch.Tensor) -> torch.Tensor:
+    """GW's analytic Newton-step gradient formula, evaluated from a fixed set
+    of k neighbor Gaussians per query point.
+
+    Shapes: points (B,3); g_means/g_normals/g_scales (B,k,3); g_rotation
+    (B,k,4); g_opacity (B,k,1). Returns (B,3), the summed
+    indicator-clipped weighted `Sigma_i^-1 @ (x - mu_i)` vector field (GW's
+    own comment: "Non normalized normal field is grad log v" -- this is NOT
+    the gradient of OUR render-based `field_fn`; see module docstring above
+    and `GaussianVectorField` below for the empirically-verified sign
+    convention that lets it stand in for one anyway).
+
+    Ported verbatim from GW's utils/primal_adaptive_meshing_utils.py::
+    get_vector_field_quantities_aux (variable names adapted only; GW returns
+    a dict with one key, we return the tensor directly since nothing else in
+    this port needs curl).
+    """
+    B, k_neighbors = g_means.shape[0], g_means.shape[1]
+    p = points.unsqueeze(1) - g_means  # (B, k, 3)
+
+    # G_i(x) via S^-1 @ R^T
+    g_invscale_rot = build_scaling_rotation(
+        s=1.0 / g_scales.view(-1, 3),
+        r=g_rotation.view(-1, 4),
+    ).transpose(-1, -2)  # (B*k, 3, 3)
+    gi_x = robust_gaussian_eval_shifted_points(
+        shifted_points=p.view(-1, 3),
+        gaussian_invscale_rot=g_invscale_rot,
+        gaussian_opacity=g_opacity.view(-1, 1),
+    ).view(B, k_neighbors, 1)  # (B, k, 1)
+
+    # Half-space clip: only Gaussians whose outward normal faces x contribute.
+    n_dot_x_minus_mu = torch.sum(g_normals * p, dim=-1, keepdim=True)  # (B, k, 1)
+    indicator_function = (n_dot_x_minus_mu >= 0).float()  # (B, k, 1)
+
+    # Sigma_i^-1 @ (x - mu_i)
+    sigma_inv = robust_sigma_inv(g_scales, g_rotation)  # (B, k, 3, 3)
+    transformed_points = torch.einsum("bkij, bkj -> bki", sigma_inv, p)  # (B, k, 3)
+
+    gaussian_quotient = gi_x / (1.0 - gi_x + 1e-8)  # (B, k, 1)
+    nabla_log = gaussian_quotient * transformed_points  # (B, k, 3)
+    normal_field = torch.sum(indicator_function * nabla_log, dim=1)  # (B, 3)
+    return normal_field
+
+
+class GaussianVectorField:
+    """GW's analytic Newton-step gradient source: a KD-tree over raw
+    Gaussian centers (built once), queried for k nearest neighbors per query
+    point, feeding `get_vector_field_quantities_aux`. Zero cameras, zero
+    rasterization, zero pixel binning -- this is exactly why it doesn't
+    inherit our rendered field's discretization noise (see module docstring).
+
+    SIGN CONVENTION (empirically verified, see
+    tests/test_pam_analytic_gradient.py -- do not re-derive by hand only,
+    the half-space-indicator clipping makes it easy to get backwards): the
+    raw output of `get_vector_field_quantities_aux`, used AS-IS with no sign
+    flip, already points toward increasing OUR field's vacancy convention
+    (field>0 empty, field<0 occupied) -- i.e. it is compatible with
+    `pam_extraction.py::_gradient_descent_refinement`'s existing Newton-step
+    formula unmodified. `tests/test_pam_analytic_gradient.py` confirms this
+    with both a direct sign check on the raw vector and an end-to-end
+    refinement-step displacement check (points move toward field==0 from
+    both sides).
+    """
+
+    @torch.no_grad()
+    def __init__(self, gaussians, k_neighbors: int = 32) -> None:
+        self.k_neighbors = k_neighbors
+        means = gaussians.get_xyz.detach().cpu().numpy()  # (N, 3)
+        self.tree = KDTree(means)
+
+    @torch.no_grad()
+    def gradient(self, query_points: torch.Tensor, gaussians) -> torch.Tensor:
+        """(N,3) query points -> (N,3) analytic gradient."""
+        device = query_points.device
+        q_np = query_points.detach().cpu().numpy()
+        _, nn_idx_np = self.tree.query(q_np, k=self.k_neighbors, workers=-1)
+        nn_idx = torch.from_numpy(nn_idx_np).to(device=device, dtype=torch.long)
+        if nn_idx.ndim == 1:  # scipy squeezes the batch dim when N==1
+            nn_idx = nn_idx.unsqueeze(0)
+
+        means = gaussians.get_xyz
+        normals = gaussians.get_normals
+        scales = gaussians.get_scaling
+        rotations = gaussians.get_rotation
+        opacity = gaussians.get_opacity
+
+        N, k = nn_idx.shape
+        flat_idx = nn_idx.reshape(-1)
+        return get_vector_field_quantities_aux(
+            query_points,
+            means[flat_idx].view(N, k, 3),
+            normals[flat_idx].view(N, k, 3),
+            scales[flat_idx].view(N, k, 3),
+            rotations[flat_idx].view(N, k, 4),
+            opacity[flat_idx].view(N, k, 1),
+        )
 
 
 # ---------------------------------------------------------------------------
