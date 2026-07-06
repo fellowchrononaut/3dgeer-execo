@@ -311,21 +311,33 @@ class GaussianRasterizer(nn.Module):
 
 
 def integrate_points(raster_settings, geomBuffer, binningBuffer, imgBuffer, num_rendered, P,
-                      q_pix_id, q_tval, q_ranges, q_point_order):
-    """Session E2: forward-only ray-integrated occupancy at query points,
-    reusing the buffers a prior `GaussianRasterizer.forward_with_buffers`
-    call produced for this view. No autograd (extraction runs under
-    `torch.no_grad()`).
+                      q_xyz_view, q_ranges, q_point_order):
+    """Session E2 (field-continuity fix per Session E2.1): forward-only
+    ray-integrated occupancy at query points, reusing the buffers a prior
+    `GaussianRasterizer.forward_with_buffers` call produced for this view.
+    No autograd (extraction runs under `torch.no_grad()`).
+
+    Session E2.1: the per-query pixel id + ray parameter (q_pix_id, q_tval)
+    were replaced by q_xyz_view -- the query point's own exact view-space
+    coordinate -- so every point gets its own sub-pixel ray instead of all
+    points inside a pixel footprint sharing the pixel-center ray (the
+    verified root cause of the piecewise-constant/staircase field). Tile
+    binning (which pixel/tile each point falls into) still happens on the
+    Python side (gaussian_wrapping/fields.py); it just no longer needs to be
+    threaded into the kernel itself.
 
     Args:
         raster_settings: the SAME `GaussianRasterizationSettings` used to
             produce `geomBuffer`/`binningBuffer`/`imgBuffer` (only
             image_height/width, render_mode, focal_x/y, tan_theta/tan_phi,
-            raymap are read).
+            raymap are read; the mode==1 pbf_tan bbox prefilter still uses
+            render_mode, the rest are unused by the kernel post-E2.1 but
+            still threaded for signature stability).
         num_rendered (int): `forward_with_buffers()["num_rendered"]`.
         P (int): number of Gaussians (`forward_with_buffers()["P"]`).
-        q_pix_id (IntTensor, (Q,)): pixel id per valid query point.
-        q_tval (FloatTensor, (Q,)): ray parameter ||x_view|| per valid point.
+        q_xyz_view (FloatTensor, (Q,3)): exact view-space point per valid
+            query point (SAME valid-subset order as the caller's own
+            pixel/tile bookkeeping).
         q_ranges (IntTensor, (num_tiles, 2)): per-tile [start,end) into
             q_point_order (SAME tile indexing as the renderer: tile =
             (v // BLOCK_Y) * grid_x + u // BLOCK_X, BLOCK_X=BLOCK_Y=16).
@@ -348,8 +360,7 @@ def integrate_points(raster_settings, geomBuffer, binningBuffer, imgBuffer, num_
             int(num_rendered),
             binningBuffer,
             imgBuffer,
-            q_pix_id,
-            q_tval,
+            q_xyz_view,
             q_ranges,
             q_point_order,
         )

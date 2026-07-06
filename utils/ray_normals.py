@@ -55,3 +55,18 @@ def view_normals_to_world(camera, n):
     pins whichever of (R @ n) / (R.T @ n) reproduces GW's convention."""
     R = camera.world_view_transform[:3, :3]              # (3,3), transposed storage
     return torch.einsum("ij,jhw->ihw", R, n)             # == R_v2w @ n
+
+
+def world_to_view_normals(camera, n_world):
+    """(3,H,W) world-space -> view-space. Inverse of view_normals_to_world.
+
+    R = camera.world_view_transform[:3, :3] is a pure rotation (orthonormal),
+    so its inverse is its transpose: world_to_view_normals(cam, n) =
+    R.T @ n_world, i.e. torch.einsum("ji,jhw->ihw", R, n_world) (note the
+    transposed index order relative to view_normals_to_world's "ij,jhw->ihw").
+    Needed by Session F2's multiview NCC loss, which operates on normals in
+    the *view* space of the reference/neighbor cameras (see
+    tests/test_normal_field.py check 5 for the round-trip verification this
+    derivation is NOT trusted without)."""
+    R = camera.world_view_transform[:3, :3]
+    return torch.einsum("ji,jhw->ihw", R, n_world)       # == R_v2w.T @ n_world == R_w2v @ n_world

@@ -255,7 +255,7 @@ def extract_mesh_pivot_mtet(
     pipe,
     output_path: str,
     iso: float = 0.0,
-    std_factor: float = 3.33,
+    std_factor: float = 3.0,  # Session E2.1: GW's ours-script default (3.33 was their radegs script)
     max_pivots: Optional[int] = 1_500_000,
     trunc_margin: Optional[float] = None,
     n_binary_steps: int = 10,

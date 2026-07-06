@@ -1198,28 +1198,38 @@ void FORWARD::render(
 // one block per tile, per-tile point range processed in BLOCK_SIZE-strided
 // rounds, inner sweep over the SAME depth-sorted Gaussian tile-batches
 // renderCUDA uses). The per-Gaussian alpha math (p_obj/d_obj/power_mah via
-// w2o rows) and the mode-0/1/2 rayf lookup are copied verbatim from
-// renderCUDA above (3DGEER's own ray-Gaussian formulation, not GOF's
-// ray-plane one) -- only the termination rule differs: no test_T<0.0001
-// early-out; instead a point stops once the (sorted-ascending) Gaussian
-// depth exceeds the point's own ray parameter t_x = ||x_view||.
+// w2o rows) is copied verbatim from renderCUDA above (3DGEER's own
+// ray-Gaussian formulation, not GOF's ray-plane one).
+//
+// Session E2.1 (field-continuity fix, 2026-07-06): the original mode-0/1/2
+// pixel-center rayf lookup + hard `depths[gid] <= t_x` gate made the field
+// piecewise-constant within each pixel footprint and discontinuous at every
+// Gaussian-depth crossing (a 3D staircase -- root cause of the ~88deg median
+// dihedral raw-mesh noise). Fixed per GOF's own approach
+// (submodules/GaussianWrapping/submodules/diff-gaussian-rasterization/cuda_rasterizer/forward.cu:1290-1330):
+// (1) rayf is now the query point's own exact view-space coordinate
+//     (q_xyz_view), not a pixel-snapped ray -- every point gets its own ray;
+// (2) the hard depth gate is replaced with a soft attenuation term inside
+//     the alpha exponential, so a Gaussian's contribution decays smoothly
+//     past the query point instead of being included/excluded by a boolean.
+// q_pix_id/q_tval are no longer needed by the kernel (tile binning happens
+// entirely in fields.py) and were dropped from this signature.
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 integrateCUDA(
 	const uint2* __restrict__ ranges,        // per-tile Gaussian range (SAME as renderCUDA)
 	const uint32_t* __restrict__ point_list, // depth-sorted Gaussian ids (SAME as renderCUDA)
 	int W, int H,
-	const int mode,
-	const float focal_x, float focal_y,
-	const float* tan_theta,
-	const float* tan_phi,
-	const float* raymap,
+	const int mode,                          // still used: gates the mode==1 pbf_tan bbox prefilter below
+	const float focal_x, float focal_y,      // Session E2.1: unused (rayf no longer pixel-derived); kept for signature/call-site stability
+	const float* tan_theta,                  // Session E2.1: unused, ditto
+	const float* tan_phi,                    // Session E2.1: unused, ditto
+	const float* raymap,                     // Session E2.1: unused, ditto
 	const float4* __restrict__ pbf_tan,
 	const float3* __restrict__ points_xyz_view,
 	const float2* __restrict__ h_opacity,
 	const float3* __restrict__ w2o_mat,
-	const float* __restrict__ depths,        // per-Gaussian Euclidean depth (GeometryState.depths)
-	const int* __restrict__ q_pix_id,        // per-query-point pixel id
-	const float* __restrict__ q_tval,        // per-query-point ray parameter t_x = ||x_view||
+	const float* __restrict__ depths,        // per-Gaussian Euclidean depth (GeometryState.depths); unused since the hard depth gate was removed (Session E2.1) -- kept fetched for a cheap early-out reinstatement if field-eval timing requires it
+	const float3* __restrict__ q_xyz_view,   // Session E2.1: per-query-point exact view-space point (unnormalized); replaces q_pix_id/q_tval
 	const uint2* __restrict__ q_ranges,      // per-tile query-point range
 	const uint32_t* __restrict__ q_point_order, // query indices sorted by tile
 	float* __restrict__ out_alpha_integrated // [num_query_points] 1 - T
@@ -1253,22 +1263,13 @@ integrateCUDA(
 		bool has_point = q_progress < q_total;
 
 		uint32_t qidx = has_point ? q_point_order[q_range.x + q_progress] : 0;
-		int pix_id = has_point ? q_pix_id[qidx] : 0;
-		float t_x = has_point ? q_tval[qidx] : 0.0f;
 
-		float3 rayf = make_float3(0.0f, 0.0f, 1.0f);
-		if (has_point)
-		{
-			int px = pix_id % W;
-			int py = pix_id / W;
-			if (mode == 0) {
-				rayf = make_float3((float)tan_theta[min(px, W - 1)], (float)tan_phi[min(py, H - 1)], 1.f);
-			} else if (mode == 1) {
-				rayf = make_float3((float)raymap[pix_id * 3], (float)raymap[pix_id * 3 + 1], (float)raymap[pix_id * 3 + 2]);
-			} else {
-				rayf = { ((float)px + 0.5f) / focal_x - W / (2.0f * focal_x), ((float)py + 0.5f) / focal_y - H / (2.0f * focal_y), 1.0f };
-			}
-		}
+		// Session E2.1: exact sub-pixel ray through the query point itself
+		// (GOF-style), not the pixel-center ray -- this is what removes the
+		// staircase (all points inside one pixel footprint used to see an
+		// identical ray). rayf is unnormalized; the query point sits at
+		// ray parameter t = 1 exactly (t_x = ||rayf|| if ever needed).
+		float3 rayf = has_point ? q_xyz_view[qidx] : make_float3(0.0f, 0.0f, 1.0f);
 
 		float T = 1.0f;
 		bool done = !has_point;
@@ -1299,14 +1300,14 @@ integrateCUDA(
 
 			for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
 			{
-				// Sorted-ascending depth -> once exceeded, this point is done
-				// (no more relevant Gaussians can appear later in the list).
-				float gdepth = collected_depth[j];
-				if (gdepth > t_x)
-				{
-					done = true;
-					break;
-				}
+				// Session E2.1: GOF sweeps the FULL per-tile contributor
+				// list -- the hard `depths[gid] <= t_x` early-exit (which
+				// caused the field to jump by alpha_i at every Gaussian-depth
+				// crossing) is removed; see the soft attenuation below.
+				// collected_depth[j] is intentionally left fetched-but-unused
+				// so a `collected_depth[j] > t_x + slack` early-out can be
+				// reinstated in one line if field-eval timing requires it
+				// (t_x = sqrtf(dot(rayf, rayf)) since rayf is now the point).
 
 				float4 b_xxyy = collected_pbf_tan[j];
 				if (mode == 1) {
@@ -1329,7 +1330,17 @@ integrateCUDA(
 				if (power_mah > 0.0f)
 					continue;
 
-				float alpha = min(0.99f, h_o.y * exp(power_mah));
+				// Session E2.1: soft depth attenuation (GOF forward.cu:1311-1313
+				// style), replaces the removed hard depth gate. rayf sits at
+				// t = 1 on the ray; t_star is the Gaussian's own closest-point
+				// ray parameter (same quantity the median-depth kernel above
+				// computes). Gaussians whose closest point is behind the query
+				// point (t_star <= 1) are unattenuated (dt = 0); Gaussians
+				// ahead of it decay smoothly with their own tail instead of
+				// being hard-included/excluded.
+				float t_star = dot(p_obj, d_obj) / dot(d_obj, d_obj);
+				float dt = fmaxf(0.0f, t_star - 1.0f);
+				float alpha = min(0.99f, h_o.y * expf(power_mah - 0.5f * dot(d_obj, d_obj) * dt * dt));
 				if (alpha < 1.0f / 255.0f)
 					continue;
 
@@ -1357,8 +1368,7 @@ void FORWARD::integrate(
 	const float2* h_opacity,
 	const float3* w2o,
 	const float* depths,
-	const int* q_pix_id,
-	const float* q_tval,
+	const float3* q_xyz_view,
 	const uint2* q_ranges,
 	const uint32_t* q_point_order,
 	float* out_alpha_integrated)
@@ -1376,8 +1386,7 @@ void FORWARD::integrate(
 		h_opacity,
 		w2o,
 		depths,
-		q_pix_id,
-		q_tval,
+		q_xyz_view,
 		q_ranges,
 		q_point_order,
 		out_alpha_integrated);

@@ -138,6 +138,7 @@ class Camera(nn.Module):
                 self.alpha_mask[..., self.alpha_mask.shape[-1] // 2:] = 0
 
         self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
+        self._gray_image = None  # ported/adapted from GaussianWrapping scene/cameras.py:69-74 (lazy, see gray_image property)
 
         self.invdepthmap = None
         self.depth_reliable = False
@@ -250,6 +251,20 @@ class Camera(nn.Module):
             self.full_proj_transform = (
                 self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))
             ).squeeze(0)
+
+    @property
+    def gray_image(self):
+        """(1,H,W) luminance of original_image. ported/adapted from
+        GaussianWrapping gaussian_wrapping/scene/cameras.py:69-74 (Session F2
+        multiview NCC loss needs a grayscale image for cross-view patch
+        correlation)."""
+        if self._gray_image is None:
+            self._gray_image = (
+                0.299 * self.original_image[0]
+                + 0.587 * self.original_image[1]
+                + 0.114 * self.original_image[2]
+            ).unsqueeze(0)
+        return self._gray_image
 
     @staticmethod
     def fov_sample2ray(fovx, fovy, interval):

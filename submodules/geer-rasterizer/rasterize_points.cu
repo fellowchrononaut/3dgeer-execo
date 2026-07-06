@@ -266,6 +266,12 @@ RasterizeGaussiansBackwardCUDA(
 // tan_theta/tan_phi/raymap, geomBuffer/binningBuffer/imageBuffer) -- plus
 // the per-query-point tile-binned arrays built on the Python side
 // (gaussian_wrapping/fields.py). Forward-only: no autograd, no gradients.
+//
+// Session E2.1: q_pix_id/q_tval (pixel-snapped ray lookup + hard depth gate)
+// were replaced by q_xyz_view (the query point's own exact view-space
+// coordinate) -- see forward.cu's integrateCUDA for why. Tile binning still
+// happens in fields.py (from the same pixel projection), it just no longer
+// needs to cross into the kernel.
 torch::Tensor IntegratePointsCUDA(
 	const int P,
 	const int image_height,
@@ -279,13 +285,12 @@ torch::Tensor IntegratePointsCUDA(
 	const int R,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
-	const torch::Tensor& q_pix_id,      // (Q,) int32, pixel id per valid query point
-	const torch::Tensor& q_tval,        // (Q,) float32, ||x_view|| per valid query point
+	const torch::Tensor& q_xyz_view,    // (Q,3) float32, exact view-space point per valid query point
 	const torch::Tensor& q_ranges,      // (num_tiles, 2) int32, [start,end) into q_point_order
 	const torch::Tensor& q_point_order) // (Q,) int32, query indices sorted by tile
 {
-	const int Q = q_pix_id.size(0);
-	auto float_opts = q_tval.options().dtype(torch::kFloat32);
+	const int Q = q_xyz_view.size(0);
+	auto float_opts = q_xyz_view.options().dtype(torch::kFloat32);
 	torch::Tensor out_alpha_integrated = torch::zeros({Q}, float_opts);
 
 	if (P != 0 && Q != 0)
@@ -303,8 +308,7 @@ torch::Tensor IntegratePointsCUDA(
 			reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 			reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
 			Q,
-			q_pix_id.contiguous().data<int>(),
-			q_tval.contiguous().data<float>(),
+			reinterpret_cast<const float3*>(q_xyz_view.contiguous().data<float>()),
 			reinterpret_cast<const uint2*>(q_ranges.contiguous().data_ptr<int>()),
 			reinterpret_cast<const uint32_t*>(q_point_order.contiguous().data_ptr<int>()),
 			out_alpha_integrated.contiguous().data<float>());

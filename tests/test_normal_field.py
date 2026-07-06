@@ -29,7 +29,7 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene import Scene
 from scene.gaussian_model import GaussianModel
 from gaussian_renderer import render, render_normal_field
-from utils.ray_normals import depth_to_normals_via_rays, view_normals_to_world
+from utils.ray_normals import depth_to_normals_via_rays, view_normals_to_world, world_to_view_normals
 from utils.general_utils import inverse_sigmoid
 
 OUT_DIR = "/home/output/sessC_test"
@@ -211,7 +211,35 @@ def main():
           f"roundtrip_err={roundtrip_err:.6f}, decode_err={conv_err:.6f}, "
           f"peak_coverage={peak:.4f}")
 
-    print("\nAll Session C checks PASSED.")
+    # ---------------------------------------------------------------
+    # Check 5 (Session F2): world_to_view_normals round-trip
+    # ---------------------------------------------------------------
+    # (a) round-trip: world_to_view_normals(view_normals_to_world(n_view)) == n_view,
+    # on a batch of random unit-ish view-space normal fields (reuse the (3,H,W)
+    # map shape so this exercises the same einsum path as production use).
+    torch.manual_seed(0)
+    n_view_rand = F.normalize(torch.randn(3, 8, 8, device="cuda"), dim=0)
+    n_world_rand = view_normals_to_world(viewpoint_cam, n_view_rand)
+    n_view_roundtrip = world_to_view_normals(viewpoint_cam, n_world_rand)
+    rt_err = (n_view_roundtrip - n_view_rand).norm(dim=0).max().item()
+    assert rt_err < 1e-4, f"world_to_view_normals round-trip failed (max err {rt_err})"
+    print(f"[INFO] check5a world_to_view_normals(view_normals_to_world(n)) round-trip max err = {rt_err:.6f}")
+
+    # (b) independent cross-check using the SAME known forward-axis fact as
+    # check 4: the camera's own optical axis is exactly [0,0,1] in its own
+    # view space, and view_dir_world (derived above from world_view_transform
+    # .inverse() row 2, NOT from view_normals_to_world) is that axis in world
+    # space. world_to_view_normals(view_dir_world) must recover [0,0,1].
+    forward_view_recovered = world_to_view_normals(
+        viewpoint_cam, view_dir_world.view(3, 1, 1)).view(3)
+    forward_expected = torch.tensor([0.0, 0.0, 1.0], device="cuda")
+    forward_err = (forward_view_recovered - forward_expected).norm().item()
+    assert forward_err < 1e-3, f"world_to_view_normals forward-axis check failed (err {forward_err})"
+    print(f"[INFO] check5b world_to_view_normals(view_dir_world) = {forward_view_recovered.tolist()} "
+          f"(expected [0,0,1]), err={forward_err:.6f}")
+    print(f"PASS check5: world_to_view_normals round-trip={rt_err:.6f}, forward-axis err={forward_err:.6f}")
+
+    print("\nAll Session C+F2 checks PASSED.")
 
 
 if __name__ == "__main__":

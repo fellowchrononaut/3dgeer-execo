@@ -89,8 +89,7 @@ torch::Tensor IntegratePointsCUDA(
 	const int R,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
-	const torch::Tensor& q_pix_id,
-	const torch::Tensor& q_tval,
+	const torch::Tensor& q_xyz_view,
 	const torch::Tensor& q_ranges,
 	const torch::Tensor& q_point_order);
 

@@ -99,8 +99,7 @@ namespace FORWARD
 		const float2* h_opacity,
 		const float3* w2o,
 		const float* depths,
-		const int* q_pix_id,
-		const float* q_tval,
+		const float3* q_xyz_view,
 		const uint2* q_ranges,
 		const uint32_t* q_point_order,
 		float* out_alpha_integrated);

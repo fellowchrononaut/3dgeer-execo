@@ -80,7 +80,10 @@ def main():
     parser.add_argument("--raymap_path", type=str, default=None)
 
     parser.add_argument("--iso", type=float, default=0.0)
-    parser.add_argument("--std_factor", type=float, default=3.33)
+    # Session E2.1: GW's actual "ours"-script default is 3.0; 3.33 is only
+    # their radegs script's setting (was mistakenly folded in as the default
+    # here in Session E2 -- see 3DGEERGW_EXECUTION.md Session E2.1 item 4).
+    parser.add_argument("--std_factor", type=float, default=3.0)
     parser.add_argument("--max_pivots", type=int, default=1_500_000)
     parser.add_argument("--trunc_margin", type=float, default=None)
     parser.add_argument("--n_binary_steps", type=int, default=10)

@@ -526,8 +526,7 @@ void CudaRasterizer::Rasterizer::integratePoints(
 	char* binning_buffer,
 	char* img_buffer,
 	const int Q,
-	const int* q_pix_id,
-	const float* q_tval,
+	const float3* q_xyz_view,
 	const uint2* q_ranges,
 	const uint32_t* q_point_order,
 	float* out_alpha_integrated,
@@ -553,7 +552,7 @@ void CudaRasterizer::Rasterizer::integratePoints(
 		geomState.h_opacity,
 		geomState.w2o,
 		geomState.depths,
-		q_pix_id, q_tval, q_ranges, q_point_order,
+		q_xyz_view, q_ranges, q_point_order,
 		out_alpha_integrated), debug)
 }
 

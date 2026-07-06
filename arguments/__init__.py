@@ -111,6 +111,24 @@ class OptimizationParams(ParamGroup):
         self.densify_and_wrap_until_iter = 26000  # GW: 26_000
         self.densify_and_wrap_interval = 1000     # GW: every 1_000
         self.wrap_quantile = 0.05            # clone only the top 5% mean-error Gaussians (GW)
+        # --- GaussianWrapping multiview NCC+geo consistency (Session F2) ---
+        # ported/adapted from GaussianWrapping regularization/multiview_gggs.py
+        # config defaults; generalized to PH+EQ via a new CUDA kernel
+        # (submodules/multiview_ncc/) instead of GW's pinhole-only
+        # warp_patch_ncc (see GUTWrap_Discussion/3DGEERGW_EXECUTION.md Session
+        # F2 for the full rationale). All default OFF / bit-identical to
+        # pre-Session-F2 behavior when --multiview is not passed.
+        self.multiview = False                    # master flag, default OFF
+        self.multiview_from_iter = 7000            # GW: start_multiview in [7000,15000]
+        self.multiview_ncc_weight = 0.6            # GW: multi_view_ncc_weight
+        self.multiview_geo_weight = 0.02           # GW: multi_view_geo_weight
+        self.multiview_patch_size = 3              # GW: multi_view_patch_size (radius; 7x7 patch)
+        self.multiview_pixel_noise_th = 1.0        # GW: multi_view_pixel_noise_th
+        self.multiview_max_angle = 30.0            # GW: multi_view_max_angle (degrees)
+        self.multiview_num = 8                     # GW: multi_view_num (neighbor cameras)
+        self.multiview_min_dis_relative = 0.002    # GW: multi_view_min_dis_relative
+        self.multiview_max_dis_relative = 0.3      # GW: multi_view_max_dis_relative
+        self.multiview_znear_relative = 0.02       # relative to scene radius (GW uses znear_relative similarly)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

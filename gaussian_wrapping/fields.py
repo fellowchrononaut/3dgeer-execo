@@ -288,7 +288,16 @@ def _forward_buffers_for_view(camera, gaussians, pipe):
 def _integrate_alpha_chunk(camera, raster_settings, buf, x_view: torch.Tensor):
     """A_v(x) for one view's already-built buffers + one chunk of
     view-space points. Returns (alpha (n,), valid (n,) bool); `alpha` is
-    only meaningful where `valid` is True."""
+    only meaningful where `valid` is True.
+
+    Session E2.1: the kernel now evaluates each query point's own exact
+    sub-pixel ray (q_xyz_view = x_view[valid_idx], unnormalized) instead of
+    snapping to the nearest pixel center -- this is what removes the
+    piecewise-constant/staircase field (root cause of the raw-mesh noise).
+    Pixel/tile binning (px, py below) is now PURELY a Python-side concern
+    for building q_ranges/q_point_order; it is no longer passed into the
+    kernel at all (q_pix_id/q_tval are gone from the whole native chain).
+    """
     n = x_view.shape[0]
     device = x_view.device
     u, v, valid = project_view_to_pixel(camera, x_view)
@@ -304,13 +313,15 @@ def _integrate_alpha_chunk(camera, raster_settings, buf, x_view: torch.Tensor):
     valid_idx = valid.nonzero(as_tuple=True)[0]
     px = u[valid_idx].round().long().clamp(0, W - 1)
     py = v[valid_idx].round().long().clamp(0, H - 1)
-    pix_id = (py * W + px).to(torch.int32).contiguous()
-    tval = x_view[valid_idx].norm(dim=-1).float().contiguous()
+    # q_xyz_view: exact (unrounded) view-space coordinate, SAME valid-subset
+    # order as px/py above (both indexed by valid_idx) -- this is the array
+    # the kernel now reads rayf from, per query point.
+    q_xyz_view = x_view[valid_idx].float().contiguous()
 
     tile = (py // _BLOCK_Y) * grid_x + (px // _BLOCK_X)
     order = torch.argsort(tile)
     tile_sorted = tile[order]
-    q_point_order = order.to(torch.int32).contiguous()  # indices into (pix_id, tval)
+    q_point_order = order.to(torch.int32).contiguous()  # indices into q_xyz_view's own order
 
     counts = torch.bincount(tile_sorted, minlength=num_tiles)
     ends = torch.cumsum(counts, dim=0).to(torch.int32)
@@ -320,7 +331,7 @@ def _integrate_alpha_chunk(camera, raster_settings, buf, x_view: torch.Tensor):
     alpha_valid = integrate_points(
         raster_settings, buf["geomBuffer"], buf["binningBuffer"], buf["imgBuffer"],
         buf["num_rendered"], buf["P"],
-        pix_id, tval, q_ranges, q_point_order,
+        q_xyz_view, q_ranges, q_point_order,
     )  # (n_valid,) aligned to valid_idx's own order
 
     alpha_full[valid_idx] = alpha_valid

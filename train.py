@@ -24,8 +24,9 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import numpy as np
 import cv2
-from utils.ray_normals import depth_to_normals_via_rays, view_normals_to_world
+from utils.ray_normals import depth_to_normals_via_rays, view_normals_to_world, world_to_view_normals, get_ray_dirs_view
 from gaussian_renderer import render_normal_field
+from utils.multiview import compute_nearest_cameras, geo_loss, eq_warp_patch_ncc, ref_to_neighbor_RT
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -50,6 +51,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         dataset.raymap = np.load(raymap_path)
     scene = Scene(dataset, gaussians, shuffle=False)
 
+    # --- GaussianWrapping multiview NCC+geo consistency (Session F2) ---
+    # Default OFF (opt.multiview=False); one-time nearest-camera precompute,
+    # pure extrinsics geometry (see utils/multiview.py::compute_nearest_cameras).
+    multiview_nearest_cameras = None
+    if opt.multiview:
+        assert opt.multiview_from_iter >= opt.normal_from_iter, (
+            "opt.multiview_from_iter must be >= opt.normal_from_iter: the multiview "
+            "loss reuses the L_N block's already-rendered world-space normal_map "
+            "instead of rendering it a second time (see train.py's per-iteration loop)."
+        )
+        assert opt.normal_weight > 0, (
+            "opt.multiview requires opt.normal_weight > 0 -- the multiview loss reuses "
+            "the L_N block's normal_map, which is only computed when normals are active."
+        )
+        multiview_nearest_cameras = compute_nearest_cameras(
+            scene.getTrainCameras(),
+            scene_radius=scene.cameras_extent,
+            multi_view_max_angle=opt.multiview_max_angle,
+            multi_view_min_dis_relative=opt.multiview_min_dis_relative,
+            multi_view_max_dis_relative=opt.multiview_max_dis_relative,
+            multi_view_num=opt.multiview_num,
+        )
+
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
@@ -68,6 +92,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
     ema_LN_for_log = 0.0
+    ema_ncc_for_log = 0.0
+    ema_geo_for_log = 0.0
 
     # Pre-compute viewer extra params so MiniCam uses the correct render mode.
     _render_model_map = {"BEAP": 0, "KB": 1, "EQ": 1, "PH": 2}
@@ -212,6 +238,68 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 depth_sv = (depth_sv * 255).astype(np.uint8)
                 cv2.imwrite(os.path.join(dump_dir, f'iter_{iteration:06d}_depth.png'), depth_sv)
 
+        # --- GaussianWrapping multiview NCC+geo consistency (Session F2) ---
+        # Reuses this iteration's already-rendered `normal_map` (world-space,
+        # from the L_N block above) and `median_depth` -- structurally requires
+        # iteration >= opt.normal_from_iter, enforced by the opt.multiview_from_iter
+        # >= opt.normal_from_iter assert at startup.
+        L_MV = torch.zeros((), device="cuda")
+        ncc_loss_val = torch.zeros((), device="cuda")
+        geo_loss_val = torch.zeros((), device="cuda")
+        multiview_active = opt.multiview and iteration >= opt.multiview_from_iter
+        if multiview_active:
+            nearest_ids = multiview_nearest_cameras.get(vind, {"nearest_id": []})["nearest_id"]
+            if len(nearest_ids) > 0:
+                neighbor_idx = nearest_ids[randint(0, len(nearest_ids) - 1)]
+                neighbor_cam = scene.getTrainCameras()[neighbor_idx]
+
+                neighbor_render_pkg = render(neighbor_cam, gaussians, pipe, background)
+                geo_loss_val, geo_mask, geo_weights = geo_loss(
+                    viewpoint_cam, neighbor_cam, render_pkg, neighbor_render_pkg,
+                    pixel_noise_th=opt.multiview_pixel_noise_th,
+                    znear_relative=opt.multiview_znear_relative,
+                    scene_radius=scene.cameras_extent,
+                )
+
+                if geo_mask.any():
+                    normal_map_view = world_to_view_normals(viewpoint_cam, normal_map)  # (3,H,W)
+                    Hc, Wc = viewpoint_cam.image_height, viewpoint_cam.image_width
+                    ys_mv, xs_mv = torch.meshgrid(
+                        torch.arange(Hc, device="cuda"), torch.arange(Wc, device="cuda"), indexing="ij"
+                    )
+                    valid_idx = geo_mask.view(-1).nonzero(as_tuple=True)[0]
+
+                    depths_sel = median_depth.view(-1)[valid_idx]
+                    normals_sel = normal_map_view.reshape(3, -1)[:, valid_idx].transpose(0, 1).contiguous()
+                    pixels_sel = torch.stack(
+                        [xs_mv.reshape(-1)[valid_idx], ys_mv.reshape(-1)[valid_idx]], dim=-1
+                    ).int()
+                    weights_sel = geo_weights.view(-1)[valid_idx]
+
+                    ray_dirs_ref = get_ray_dirs_view(viewpoint_cam).permute(1, 2, 0).contiguous()
+                    R_rn, T_rn = ref_to_neighbor_RT(viewpoint_cam, neighbor_cam)
+                    image_r = viewpoint_cam.gray_image.squeeze(0).cuda()
+                    image_n = neighbor_cam.gray_image.squeeze(0).cuda()
+
+                    ncc, ncc_valid = eq_warp_patch_ncc(
+                        depths_sel, normals_sel, pixels_sel, ray_dirs_ref, R_rn, T_rn,
+                        image_r, image_n, neighbor_cam.render_model,
+                        neighbor_cam.focal_x, neighbor_cam.focal_y,
+                        neighbor_cam.principal_x, neighbor_cam.principal_y,
+                        opt.multiview_patch_size,
+                    )
+                    # 1 - correlation, weighted by the same geo-consistency
+                    # weights, poor-match rejection (ncc_term>=0.9) -- mirrors
+                    # GaussianWrapping's own PatchMatch.__call__ masking
+                    # (multiview_gggs.py:291-298).
+                    ncc_term = torch.clamp(1.0 - ncc, 0.0, 2.0)
+                    ncc_mask = (ncc_term < 0.9) & ncc_valid
+                    if ncc_mask.any():
+                        ncc_loss_val = (ncc_term * weights_sel)[ncc_mask].mean()
+
+                L_MV = opt.multiview_ncc_weight * ncc_loss_val + opt.multiview_geo_weight * geo_loss_val
+                loss = loss + L_MV
+
         loss.backward()
 
         iter_end.record()
@@ -223,11 +311,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             normals_active = iteration >= opt.normal_from_iter and opt.normal_weight > 0
             if normals_active:
                 ema_LN_for_log = 0.4 * L_N.item() + 0.6 * ema_LN_for_log
+            if multiview_active:
+                ema_ncc_for_log = 0.4 * ncc_loss_val.item() + 0.6 * ema_ncc_for_log
+                ema_geo_for_log = 0.4 * geo_loss_val.item() + 0.6 * ema_geo_for_log
 
             if iteration % 10 == 0:
                 postfix = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"}
                 if normals_active:
                     postfix["L_N"] = f"{ema_LN_for_log:.{7}f}"
+                if multiview_active:
+                    postfix["ncc"] = f"{ema_ncc_for_log:.{7}f}"
+                    postfix["geo"] = f"{ema_geo_for_log:.{7}f}"
                 progress_bar.set_postfix(postfix)
                 progress_bar.update(10)
             if iteration == opt.iterations:
@@ -237,6 +331,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if tb_writer and normals_active:
                 tb_writer.add_scalar('train_loss/L_N', L_N.item(), iteration)
                 tb_writer.add_scalar('train_loss/L_DN', L_DN.item(), iteration)
+            if tb_writer and multiview_active:
+                tb_writer.add_scalar('train_loss/ncc_loss', ncc_loss_val.item(), iteration)
+                tb_writer.add_scalar('train_loss/geo_loss', geo_loss_val.item(), iteration)
+                tb_writer.add_scalar('train_loss/L_MV', L_MV.item(), iteration)
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), dataset.train_test_exp, valid_mask)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))

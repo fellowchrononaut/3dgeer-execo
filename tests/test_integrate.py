@@ -22,6 +22,18 @@ kernel (geer-rasterizer) through the full Python path
 gate) the sign-agreement fraction between the integrated field and the
 Session-E TSDF field on 200k random pivots (expect >0.7 but NOT 1.0 -- they
 are different fields).
+
+Session E2.1 (field-continuity fix) additions:
+  - the behind-point analytic-vs-rendered-pixel check above now tolerates
+    1e-2 (not an exact match) -- the kernel evaluates each query point's own
+    exact sub-pixel ray, which by design differs slightly from the rendered
+    pixel's pixel-center ray.
+  - `continuity_test`: samples the field along two 1000-point segments
+    through real truck geometry (lateral, perpendicular to a camera ray at
+    fixed depth; and along-ray/depth) spanning ~2 pixel footprints near a
+    real surface crossing, and asserts no adjacent-sample field jump exceeds
+    1e-3 away from the true (legitimate) crossing -- the pre-fix field showed
+    O(alpha) jumps here from pixel-snapping + the hard depth gate.
 """
 import math
 import os
@@ -46,6 +58,7 @@ from gaussian_wrapping.fields import (
     fuse_tsdf_at_points,
     render_depth_maps,
     world_to_view,
+    view_to_world,
 )
 from gaussian_wrapping.fisheye_proj import project_view_to_pixel
 from gaussian_wrapping.pivots import extract_gaussian_pivots
@@ -148,8 +161,105 @@ def analytic_test(pipe, camera):
     print(f"[analytic] render cross-check @ pixel ({py},{px}): "
           f"alpha_render={alpha_render:.6f}, alpha_integrated={a_behind:.6f}, "
           f"|diff|={diff:.6f}")
-    assert diff < 0.02, f"integrated vs rendered alpha mismatch: {diff}"
-    print("PASS analytic: integrated alpha(behind) matches rendered pixel alpha")
+    # Session E2.1: integrate_points now evaluates the query point's own
+    # EXACT sub-pixel ray (through p_behind's precise projection), while the
+    # rendered pixel's alpha is accumulated along the PIXEL-CENTER ray -- the
+    # two rays are no longer identical in general (that identity was exactly
+    # the staircase bug this session fixes), so this is a close-agreement
+    # check, not an exact match. 1e-2 comfortably separates "same Gaussian,
+    # slightly different ray" from a real regression.
+    assert diff < 1e-2, f"integrated vs rendered alpha mismatch: {diff}"
+    print("PASS analytic: integrated alpha(behind) matches rendered pixel alpha (within 1e-2)")
+
+
+@torch.no_grad()
+def continuity_test(pipe, gaussians, camera):
+    """Session E2.1 verification (b)(ii): continuity probe for the
+    field-continuity fix. Before the fix, `integrateCUDA` snapped every
+    query point to its nearest pixel center to look up `rayf`, so ALL points
+    inside one ~pixel-sized 3D cell saw an identical ray and got identical
+    alpha contributions -- the field was piecewise-constant, jumping by
+    O(alpha_i) at pixel-footprint boundaries and at every Gaussian-depth
+    crossing (the hard `depths[gid] <= t_x` gate). This probes two real
+    segments through the truck for exactly that signature:
+      (a) LATERAL: perpendicular to a real camera ray, at a fixed depth near
+          the surface, spanning ~2 pixel footprints (world-space units).
+      (b) DEPTH: along that same ray, spanning an equivalent range in depth
+          (crosses whichever Gaussian(s) dominate the surface there).
+    Both segments genuinely cross the true isosurface once (a real, legitimately
+    steep transition -- not the bug), so the true crossing sample is excluded
+    from the "no unexpected jump" assertion; everywhere else, adjacent-sample
+    |delta field| must stay far below the old O(alpha) step size.
+    """
+    W, H = camera.image_width, camera.image_height
+    assert camera.render_model == 2, "continuity_test assumes PH (pinhole) truck cameras"
+    px, py = W // 2, H // 2  # a real pixel -- image center, expected to hit the truck
+
+    # View-space ray direction (unnormalized, z=1) through this pixel's exact
+    # center -- algebraic inverse of fisheye_proj.py's PH projection formula.
+    dir_view = torch.tensor(
+        [(px + 0.5 - W / 2.0) / camera.focal_x, (py + 0.5 - H / 2.0) / camera.focal_y, 1.0],
+        device="cuda")
+
+    def points_at_depths(depths: torch.Tensor) -> torch.Tensor:
+        pts_view = dir_view.view(1, 3) * depths.view(-1, 1)
+        return view_to_world(camera, pts_view)
+
+    def max_jump_excluding_crossing(field: torch.Tensor, margin: int = 20):
+        diffs = (field[1:] - field[:-1]).abs()
+        sample_signs = torch.sign(field)
+        cross = (sample_signs[:-1] * sample_signs[1:] < 0).nonzero(as_tuple=True)[0]
+        keep = torch.ones_like(diffs, dtype=torch.bool)
+        for c in cross.tolist():
+            lo, hi = max(0, c - margin), min(diffs.shape[0], c + margin + 1)
+            keep[lo:hi] = False
+        excl_max = diffs[keep].max().item() if bool(keep.any()) else 0.0
+        return excl_max, diffs.max().item(), cross.numel()
+
+    # 1) Coarse depth scan along the central ray to locate a real surface
+    # crossing (field sign change) to probe near.
+    coarse_depths = torch.linspace(0.3, 20.0, 400, device="cuda")
+    coarse_field = evaluate_occupancy_integrated(
+        points_at_depths(coarse_depths), [camera], gaussians, pipe)
+    coarse_signs = torch.sign(coarse_field)
+    crossings = (coarse_signs[:-1] * coarse_signs[1:] < 0).nonzero(as_tuple=True)[0]
+    assert crossings.numel() > 0, (
+        "no surface crossing found along the image-center ray in [0.3,20]u -- "
+        "pick a different pixel/camera for this probe")
+    d_surf = 0.5 * (coarse_depths[crossings[0]] + coarse_depths[crossings[0] + 1]).item()
+
+    # world-space size of one pixel at depth d_surf (PH: pixel angular size
+    # ~= 1/focal_x rad); half-span = 1 pixel each side -> a ~2-pixel-wide
+    # segment total, spanning adjacent pixels, for both segments below.
+    pixel_world_size = d_surf / camera.focal_x
+    span = pixel_world_size
+
+    # 2) LATERAL segment: perpendicular to the ray, fixed depth = d_surf.
+    right_view = torch.tensor([1.0, 0.0, 0.0], device="cuda")
+    offsets = torch.linspace(-span, span, 1000, device="cuda")
+    lateral_pts_view = dir_view.view(1, 3) * d_surf + offsets.view(-1, 1) * right_view.view(1, 3)
+    lateral_field = evaluate_occupancy_integrated(
+        view_to_world(camera, lateral_pts_view), [camera], gaussians, pipe)
+
+    # 3) DEPTH segment: along the ray, spanning the same order-of-magnitude
+    # range around d_surf.
+    depths = torch.linspace(d_surf - span, d_surf + span, 1000, device="cuda")
+    depth_field = evaluate_occupancy_integrated(points_at_depths(depths), [camera], gaussians, pipe)
+
+    lateral_excl_max, lateral_raw_max, lateral_n_cross = max_jump_excluding_crossing(lateral_field)
+    depth_excl_max, depth_raw_max, depth_n_cross = max_jump_excluding_crossing(depth_field)
+
+    print(f"[continuity] pixel=({px},{py}) d_surf={d_surf:.4f}u pixel_world_size={pixel_world_size:.5f}u "
+          f"span=+-{span:.5f}u")
+    print(f"[continuity] LATERAL: max|delta field| excl. crossing = {lateral_excl_max:.6f} "
+          f"(raw incl. crossing = {lateral_raw_max:.6f}, {lateral_n_cross} crossing(s) over 1000 samples)")
+    print(f"[continuity] DEPTH:   max|delta field| excl. crossing = {depth_excl_max:.6f} "
+          f"(raw incl. crossing = {depth_raw_max:.6f}, {depth_n_cross} crossing(s) over 1000 samples)")
+
+    assert lateral_excl_max < 1e-3, f"lateral field discontinuity away from the true crossing: {lateral_excl_max}"
+    assert depth_excl_max < 1e-3, f"depth field discontinuity away from the true crossing: {depth_excl_max}"
+    print("PASS continuity: no staircase jumps > 1e-3 away from the true surface crossing "
+          "(old pixel-snapped/hard-gate field showed O(alpha) jumps here)")
 
 
 @torch.no_grad()
@@ -213,6 +323,7 @@ def main():
 
     camera = scene.getTrainCameras()[0]
     analytic_test(pipe, camera)
+    continuity_test(pipe, gaussians, camera)
 
     if args.crosscheck:
         field_crosscheck(pipe, gaussians, scene.getTrainCameras())
