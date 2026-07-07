@@ -33,6 +33,8 @@ from utils.graphics_utils import getWorld2View2
 from utils.ray_normals import get_ray_dirs_view
 import utils.multiview as multiview_mod
 from utils.multiview import (
+    expected_depth_from_invdepth,
+    straight_through_median_depth,
     ncc_reference_oracle,
     geo_loss,
     eq_warp_patch_ncc,
@@ -148,12 +150,12 @@ def check_flat_plane_ncc(model_name, render_model, patch_radius=3):
     assert frac_valid > 0.8, f"{model_name}: too few valid patches ({frac_valid})"
     assert median_ncc > 0.95, f"{model_name}: flat-plane median NCC too low ({median_ncc})"
 
-    # geo_loss sanity check on the same synthetic setup: build render_pkg-like
-    # dicts (median_depth) and confirm near-zero pixel drift / loss.
-    ref_pkg = {"median_depth": depth_r.unsqueeze(0)}
+    # geo_loss sanity check on the same synthetic setup: sample neighbor
+    # median-depth as the measurement and confirm near-zero pixel drift / loss.
     neighbor_pkg = {"median_depth": depth_n.unsqueeze(0)}
     gloss, gmask, gweights = geo_loss(
-        ref_cam, neighbor_cam, ref_pkg, neighbor_pkg,
+        ref_cam, neighbor_cam, depth_r.unsqueeze(0), neighbor_pkg,
+        ref_depth_valid=depth_r.unsqueeze(0) > 0,
         pixel_noise_th=2.0, znear_relative=0.01, scene_radius=plane_scene_radius(),
     )
     print(f"[{model_name}] geo_loss on flat plane: loss={gloss.item():.6f}, "
@@ -164,8 +166,84 @@ def check_flat_plane_ncc(model_name, render_model, patch_radius=3):
     return ref_cam, neighbor_cam, image_r, image_n
 
 
+def check_geo_loss_ref_depth_gradient(model_name, render_model):
+    ref_cam, neighbor_cam, _, _, depth_r, depth_n = build_flat_scene(render_model)
+    ref_depth = (depth_r * 1.02).unsqueeze(0).detach().clone().requires_grad_(True)
+    neighbor_pkg = {"median_depth": depth_n.unsqueeze(0)}
+
+    gloss, gmask, _ = geo_loss(
+        ref_cam, neighbor_cam, ref_depth, neighbor_pkg,
+        ref_depth_valid=ref_depth > 0,
+        pixel_noise_th=2.0, znear_relative=0.01, scene_radius=plane_scene_radius(),
+    )
+    gloss.backward()
+    grad = ref_depth.grad
+    grad_on_mask = grad.squeeze(0)[gmask]
+    grad_norm = grad_on_mask.abs().sum().item() if grad_on_mask.numel() else 0.0
+    print(f"[{model_name}] geo_loss reference-depth grad: loss={gloss.item():.6f}, "
+          f"coverage={gmask.float().mean().item():.3f}, grad_l1={grad_norm:.3e}")
+    assert gmask.any(), f"{model_name}: geo_loss mask unexpectedly empty in gradient check"
+    assert torch.isfinite(grad_on_mask).all(), f"{model_name}: geo_loss reference-depth gradient has NaNs/Infs"
+    assert grad_norm > 0.0, f"{model_name}: geo_loss lost its reference-depth gradient"
+    print(f"PASS [{model_name}] geo_loss propagates through reference expected depth")
+
+
 def plane_scene_radius():
     return 8.0  # matches plane_z default; scene extent is O(few) world units
+
+
+def check_expected_depth_from_invdepth(model_name, render_model):
+    ref_cam, _, _, _, depth_r, _ = build_flat_scene(render_model)
+    invdepth = (1.0 / depth_r.clamp_min(1e-6)).detach().clone()
+    invdepth[0, 0] = 0.0
+    invdepth = invdepth.unsqueeze(0).requires_grad_(True)
+
+    expected_depth, valid = expected_depth_from_invdepth(invdepth)
+    diff = (expected_depth.squeeze(0)[valid.squeeze(0)] - depth_r[valid.squeeze(0)]).abs()
+    max_diff = diff.max().item()
+    print(f"[{model_name}] expected-depth conversion: valid={valid.float().mean().item():.3f}, "
+          f"max|diff|={max_diff:.3e}")
+    assert not bool(valid[0, 0, 0]), f"{model_name}: zero inverse-depth pixel should be invalid"
+    assert expected_depth[0, 0, 0].item() == 0.0, f"{model_name}: invalid expected depth must stay zero"
+    assert max_diff < 1e-4, f"{model_name}: expected-depth conversion drifted ({max_diff})"
+
+    expected_depth[valid].sum().backward()
+    grad = invdepth.grad
+    assert grad[0, 0, 0].item() == 0.0, f"{model_name}: invalid pixel received depth gradient"
+    assert torch.isfinite(grad[valid]).all(), f"{model_name}: expected-depth gradients must be finite"
+    assert grad[valid].abs().max().item() > 0.0, f"{model_name}: valid expected-depth path lost gradients"
+    # Touch the camera so the fixture is visibly tied to the projection model in logs.
+    assert ref_cam.render_model == render_model
+    print(f"PASS [{model_name}] expected inverse-depth wiring is differentiable on valid pixels")
+
+
+def check_straight_through_median():
+    torch.manual_seed(7)
+    P, H, W = 50, 8, 10
+    xyz = (torch.randn(P, 3, device="cuda") * 2.0 + torch.tensor([0., 0., 6.], device="cuda")).requires_grad_(True)
+    wvt = torch.eye(4, device="cuda")  # identity extrinsics: view == world
+    gidx = torch.randint(-1, P, (H, W), device="cuda", dtype=torch.int32)
+    md = torch.rand(1, H, W, device="cuda") * 5.0 + 1.0
+    md[0, 0, 1] = 0.0  # crossed pixel with zero rasterized depth -> invalid
+
+    depth, valid = straight_through_median_depth(md, gidx, xyz, wvt)
+    assert torch.equal(depth.detach(), md), "ST value must be the exact median depth"
+    assert torch.equal(valid, (gidx >= 0).unsqueeze(0) & (md > 0)), "validity mask wrong"
+
+    depth[valid].sum().backward()
+    grad = xyz.grad
+    used = torch.zeros(P, dtype=torch.bool, device="cuda")
+    used[gidx[(gidx >= 0) & (md[0] > 0)].long()] = True
+    assert (grad[~used] == 0).all(), "gaussians not referenced by valid pixels must get no grad"
+    assert (grad[used].norm(dim=-1) > 0).all(), "every referenced gaussian must get grad"
+    # direction: d||x||/dx = x/||x|| times the pixel count referencing it
+    i = int(used.nonzero()[0])
+    n_i = int(((gidx == i) & (md[0] > 0)).sum())
+    expect = xyz[i].detach() / xyz[i].detach().norm() * n_i
+    err = (grad[i] - expect).norm() / expect.norm()
+    assert err < 1e-5, f"grad direction/scale off ({err})"
+    print(f"PASS straight-through median: exact value, gradient routed to "
+          f"{int(used.sum())}/{P} crossing gaussians, unit-direction err {err:.1e}")
 
 
 def check_cuda_vs_oracle(model_name, render_model, n_points=200, patch_radius=3, tol=5e-3):
@@ -567,6 +645,13 @@ def benchmark_backward_modes(model_name, render_model, n_points=10000, patch_rad
 
 
 def main():
+    print("=== Step 1: differentiable reference-depth wiring ===")
+    check_expected_depth_from_invdepth("PH", render_model=2)
+    check_expected_depth_from_invdepth("EQ", render_model=1)
+    check_geo_loss_ref_depth_gradient("PH", render_model=2)
+    check_geo_loss_ref_depth_gradient("EQ", render_model=1)
+    check_straight_through_median()
+
     print("=== Step 2: pure-PyTorch oracle self-test (flat plane, NCC ~= 1) ===")
     check_flat_plane_ncc("PH", render_model=2)
     check_flat_plane_ncc("EQ", render_model=1)

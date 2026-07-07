@@ -40,6 +40,8 @@ namespace BACKWARD
 		const uint32_t* n_contrib,
 		const float* dL_dpixels,
 		const float* dL_invdepths,
+		const float* median_depth,
+		const float* dL_dmedian,
 		float3* dL_dmean2D,
 		glm::vec3* dL_dmeans,
 		float* dL_dopacity,

@@ -177,6 +177,8 @@ RasterizeGaussiansBackwardCUDA(
 	const float tan_fovy,
     const torch::Tensor& dL_dout_color,
 	const torch::Tensor& dL_dout_invdepth,
+	const torch::Tensor& median_depth,
+	const torch::Tensor& dL_dout_median,
 	const torch::Tensor& sh,
 	const int degree,
 	const torch::Tensor& campos,
@@ -217,6 +219,14 @@ RasterizeGaussiansBackwardCUDA(
 	dL_dout_invdepthptr = dL_dout_invdepth.data<float>();
   }
 
+  const float* median_depthptr = nullptr;
+  const float* dL_dout_medianptr = nullptr;
+  if (median_depth.size(0) != 0 && dL_dout_median.size(0) != 0)
+  {
+	median_depthptr = median_depth.contiguous().data<float>();
+	dL_dout_medianptr = dL_dout_median.contiguous().data<float>();
+  }
+
   if(P != 0)
   {  
 	  CudaRasterizer::Rasterizer::backward(P, degree, M, R,
@@ -243,6 +253,8 @@ RasterizeGaussiansBackwardCUDA(
 	  reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
 	  dL_dout_color.contiguous().data<float>(),
 	  dL_dout_invdepthptr,
+	  median_depthptr,
+	  dL_dout_medianptr,
 	  dL_dmeans2D.contiguous().data<float>(),
 	  dL_dopacity.contiguous().data<float>(),
 	  dL_dcolors.contiguous().data<float>(),

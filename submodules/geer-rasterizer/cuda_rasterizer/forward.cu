@@ -1111,10 +1111,24 @@ renderCUDA(
 			// Median (0.5-transmittance) depth + owning Gaussian id.
 			// p_obj/d_obj are the canonical-frame ray quantities (Eq.5);
 			// the closest-point parameter t* along rayf is frame-invariant.
+			// Session G: interpolate the exact T(t)=0.5 crossing under the
+			// continuous along-ray model
+			//   T(t) = T_before * (1 - alpha * exp(-0.5*((t - t*)*rsigma)^2)),
+			// giving t_m = t* - sqrt(-2 ln x)/rsigma with
+			//   x = (1 - 0.5/T_before)/alpha in (0,1].
+			// Storing the peak t* itself (previous behavior) makes the
+			// implicit-function median backward singular at t_delta = 0;
+			// GW's own median is likewise sub-Gaussian interpolated.
 			if (out_median_depth != nullptr && T > 0.5f && test_T <= 0.5f) {
-				float t_star = dot(p_obj, d_obj) / dot(d_obj, d_obj);
-				out_median_depth[pix_id] = t_star * sqrtf(dot(rayf, rayf));
-				out_gidx[pix_id] = collected_id[j];
+				const float dns = dot(d_obj, d_obj);
+				const float t_star = dot(p_obj, d_obj) / dns;
+				const float rsig = sqrtf(dns);
+				const float x_med = fminf((1.f - 0.5f / T) / alpha, 1.f);
+				const float t_med = t_star - sqrtf(fmaxf(-2.f * logf(fmaxf(x_med, 1e-12f)), 0.f)) / rsig;
+				if (isfinite(t_med) && t_med > 0.f) {
+					out_median_depth[pix_id] = t_med * sqrtf(dot(rayf, rayf));
+					out_gidx[pix_id] = collected_id[j];
+				}
 			}
 
 			// Eq. (3) from 3D Gaussian splatting paper.

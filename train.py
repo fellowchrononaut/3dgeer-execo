@@ -83,6 +83,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
     ema_LN_for_log = 0.0
+    ema_LDN_for_log = 0.0
     ema_ncc_for_log = 0.0
     ema_geo_for_log = 0.0
     ema_flatten_for_log = 0.0
@@ -189,24 +190,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = 0
 
         # --- GW surface-alignment losses ---
-        median_depth = render_pkg["median_depth"]                # (1,H,W), no grad path
+        median_depth = render_pkg["median_depth"]                # (1,H,W), differentiable (Session G)
         L_N = torch.zeros((), device="cuda"); L_DN = torch.zeros((), device="cuda")
         shape_map = None
-        if iteration >= opt.normal_from_iter and opt.normal_weight > 0:
+        target_n_world = None
+        normals_active = iteration >= opt.normal_from_iter and opt.normal_weight > 0
+        multiview_active = opt.multiview and iteration >= opt.multiview_from_iter
+        # L_DN co-activates with multiview, exactly as GW/GGGS couple them:
+        # one reg_kick_on gate (regularization_from_iter=7000) turns on BOTH
+        # lambda_depth_normal=0.05 and the patchmatch losses (GGGS train.py:159-179,
+        # GW train.py:773-774; the published-run script overrides neither).
+        # Running multiview alone 7k-20k grew needle spikes + transparency
+        # holes (sessF2_mv_r1_fix2 post-mortem).
+        dn_active = opt.depth_normal_weight > 0 and (normals_active or multiview_active)
+        if normals_active or dn_active:
             with torch.no_grad():
                 target_n_view, valid = depth_to_normals_via_rays(viewpoint_cam, median_depth)
                 target_n_world = view_normals_to_world(viewpoint_cam, target_n_view)
+        if dn_active:
+            shape_map = render_normal_field(viewpoint_cam, gaussians, pipe, shape=True)
+            cos_DN = (shape_map * target_n_world).sum(dim=0)
+            if valid.any():
+                L_DN = (1.0 - cos_DN[valid]).mean()
+                loss = loss + opt.depth_normal_weight * L_DN
+        if normals_active:
             normal_map = render_normal_field(viewpoint_cam, gaussians, pipe)   # (3,H,W) world
             cos_N = (normal_map * target_n_world).sum(dim=0)
             if valid.any():
                 L_N = (1.0 - cos_N[valid]).mean()
                 loss = loss + opt.normal_weight * L_N
-            if opt.depth_normal_weight > 0:
-                shape_map = render_normal_field(viewpoint_cam, gaussians, pipe, shape=True)
-                cos_DN = (shape_map * target_n_world).sum(dim=0)
-                if valid.any():
-                    L_DN = (1.0 - cos_DN[valid]).mean()
-                    loss = loss + opt.depth_normal_weight * L_DN
             # online per-Gaussian error for wrapping densification
             with torch.no_grad():
                 gidx = render_pkg["gidx"]                        # (H,W) int32, -1 = none
@@ -217,32 +229,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.normal_error_accum.index_add_(0, ids, err[sel].flatten())
                     gaussians.normal_error_count.index_add_(0, ids, torch.ones_like(ids, dtype=torch.float))
 
-            if iteration % 500 == 0:
-                dump_dir = os.path.join(scene.model_path, "normal_dumps")
-                os.makedirs(dump_dir, exist_ok=True)
-                render_sv = (normal_map.detach() * 0.5 + 0.5).permute(1, 2, 0).clamp(0, 1).cpu().numpy()
-                render_sv = (render_sv * 255).astype(np.uint8)
-                cv2.imwrite(os.path.join(dump_dir, f'iter_{iteration:06d}_render.png'), render_sv[:, :, [2, 1, 0]])
-                target_sv = (target_n_world.detach() * 0.5 + 0.5).permute(1, 2, 0).clamp(0, 1).cpu().numpy()
-                target_sv = (target_sv * 255).astype(np.uint8)
-                cv2.imwrite(os.path.join(dump_dir, f'iter_{iteration:06d}_target.png'), target_sv[:, :, [2, 1, 0]])
-                depth_sv = median_depth.detach().squeeze(0)
-                depth_sv = (depth_sv / depth_sv.max().clamp(min=1e-8)).clamp(0, 1).cpu().numpy()
-                depth_sv = (depth_sv * 255).astype(np.uint8)
-                cv2.imwrite(os.path.join(dump_dir, f'iter_{iteration:06d}_depth.png'), depth_sv)
-
         # --- GaussianWrapping multiview NCC+geo consistency (Session F2) ---
         # Uses SHAPE normals (render_normal_field(..., shape=True)), decoupled
         # from L_N's learned-normal/normal_from_iter schedule so multiview can
         # be active as early as iter 7000 regardless of when L_N/L_DN start.
-        # Reuses `median_depth` from render_pkg (always available) and, if the
-        # L_DN pass above already rendered a shape map this iteration (only
-        # when iteration >= opt.normal_from_iter and opt.depth_normal_weight >
-        # 0), reuses it instead of rendering a second time.
+        # Reference-side depth is the rasterizer's natively differentiable
+        # median (Session G implicit-function backward with the opacity
+        # relief valve — NOT 1/expected_invdepth, which is no surface
+        # depth and collapsed training; see sessF2_mv_r1_fix post-mortem).
+        # Neighbor-side sampled depth stays the no-grad median-depth
+        # measurement. If the L_DN pass above already rendered a shape map
+        # this iteration, reuse it instead of rendering a second time.
         L_MV = torch.zeros((), device="cuda")
         ncc_loss_val = torch.zeros((), device="cuda")
         geo_loss_val = torch.zeros((), device="cuda")
-        multiview_active = opt.multiview and iteration >= opt.multiview_from_iter
         if multiview_active:
             nearest_ids = multiview_nearest_cameras.get(vind, {"nearest_id": []})["nearest_id"]
             if len(nearest_ids) > 0:
@@ -250,8 +250,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 neighbor_cam = scene.getTrainCameras()[neighbor_idx]
 
                 neighbor_render_pkg = render(neighbor_cam, gaussians, pipe, background)
+                # Session G: median_depth is natively differentiable (implicit
+                # backward with the opacity relief valve, like GW). No more
+                # straight-through surrogate.
+                ref_depth_valid = median_depth > 0
                 geo_loss_val, geo_mask, geo_weights = geo_loss(
-                    viewpoint_cam, neighbor_cam, render_pkg, neighbor_render_pkg,
+                    viewpoint_cam, neighbor_cam, median_depth, neighbor_render_pkg,
+                    ref_depth_valid=ref_depth_valid,
                     pixel_noise_th=opt.multiview_pixel_noise_th,
                     znear_relative=opt.multiview_znear_relative,
                     scene_radius=scene.cameras_extent,
@@ -298,6 +303,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 L_MV = opt.multiview_ncc_weight * ncc_loss_val + opt.multiview_geo_weight * geo_loss_val
                 loss = loss + L_MV
 
+        # --- periodic normal/depth dumps (outside the L_N gate so the
+        # multiview phase, active from iter 7000, is visually monitorable
+        # long before normals start at 20k; dumps the SHAPE normal field —
+        # the one multiview regularizes — and adds the learned-normal render
+        # once L_N is active) ---
+        if iteration % 500 == 0 and (normals_active or multiview_active):
+            dump_dir = os.path.join(scene.model_path, "normal_dumps")
+            os.makedirs(dump_dir, exist_ok=True)
+            if normals_active:
+                render_sv = (normal_map.detach() * 0.5 + 0.5).permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+                render_sv = (render_sv * 255).astype(np.uint8)
+                cv2.imwrite(os.path.join(dump_dir, f'iter_{iteration:06d}_render.png'), render_sv[:, :, [2, 1, 0]])
+            if target_n_world is None:
+                with torch.no_grad():
+                    target_n_view, _dump_valid = depth_to_normals_via_rays(viewpoint_cam, median_depth)
+                    target_n_world = view_normals_to_world(viewpoint_cam, target_n_view)
+            if shape_map is None:
+                with torch.no_grad():
+                    shape_map = render_normal_field(viewpoint_cam, gaussians, pipe, shape=True)
+            shape_sv = (shape_map.detach() * 0.5 + 0.5).permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+            shape_sv = (shape_sv * 255).astype(np.uint8)
+            cv2.imwrite(os.path.join(dump_dir, f'iter_{iteration:06d}_shape.png'), shape_sv[:, :, [2, 1, 0]])
+            target_sv = (target_n_world.detach() * 0.5 + 0.5).permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+            target_sv = (target_sv * 255).astype(np.uint8)
+            cv2.imwrite(os.path.join(dump_dir, f'iter_{iteration:06d}_target.png'), target_sv[:, :, [2, 1, 0]])
+            depth_sv = median_depth.detach().squeeze(0)
+            depth_sv = (depth_sv / depth_sv.max().clamp(min=1e-8)).clamp(0, 1).cpu().numpy()
+            depth_sv = (depth_sv * 255).astype(np.uint8)
+            cv2.imwrite(os.path.join(dump_dir, f'iter_{iteration:06d}_depth.png'), depth_sv)
+
         # --- GW gaussian flattening loss (F2 completion; default OFF) ---
         L_flatten = torch.zeros((), device="cuda")
         flatten_active = opt.flatten_weight > 0 and iteration >= opt.flatten_from_iter
@@ -313,9 +348,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
-            normals_active = iteration >= opt.normal_from_iter and opt.normal_weight > 0
             if normals_active:
                 ema_LN_for_log = 0.4 * L_N.item() + 0.6 * ema_LN_for_log
+            if dn_active:
+                ema_LDN_for_log = 0.4 * L_DN.item() + 0.6 * ema_LDN_for_log
             if multiview_active:
                 ema_ncc_for_log = 0.4 * ncc_loss_val.item() + 0.6 * ema_ncc_for_log
                 ema_geo_for_log = 0.4 * geo_loss_val.item() + 0.6 * ema_geo_for_log
@@ -326,6 +362,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 postfix = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"}
                 if normals_active:
                     postfix["L_N"] = f"{ema_LN_for_log:.{7}f}"
+                if dn_active:
+                    postfix["L_DN"] = f"{ema_LDN_for_log:.{7}f}"
                 if multiview_active:
                     postfix["ncc"] = f"{ema_ncc_for_log:.{7}f}"
                     postfix["geo"] = f"{ema_geo_for_log:.{7}f}"
@@ -339,6 +377,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Log and save
             if tb_writer and normals_active:
                 tb_writer.add_scalar('train_loss/L_N', L_N.item(), iteration)
+            if tb_writer and dn_active:
                 tb_writer.add_scalar('train_loss/L_DN', L_DN.item(), iteration)
             if tb_writer and multiview_active:
                 tb_writer.add_scalar('train_loss/ncc_loss', ncc_loss_val.item(), iteration)

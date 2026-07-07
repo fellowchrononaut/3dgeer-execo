@@ -97,16 +97,18 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
-        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, radii, sh, opacities, geomBuffer, binningBuffer, imgBuffer)
-        ctx.mark_non_differentiable(radii, median_depth, gidx)
+        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, radii, sh, opacities, geomBuffer, binningBuffer, imgBuffer, median_depth)
+        ctx.mark_non_differentiable(radii, gidx)
         return color, radii, invdepths, kernel_times, ranges, median_depth, gidx
 
     @staticmethod
     def backward(ctx, grad_out_color, grad_radii, grad_out_depth, grad_kernel_times, grad_ranges, grad_median_depth, grad_gidx):
         """Backward pass: propagate gradients from pixel loss to Gaussian parameters.
 
-        Inputs grad_out_color [C,H,W] and grad_out_depth [1,H,W]; grad_radii,
-        grad_kernel_times, grad_ranges, grad_median_depth, and grad_gidx are unused
+        Inputs grad_out_color [C,H,W], grad_out_depth [1,H,W] and
+        grad_median_depth [1,H,W] (median depth is differentiable as of
+        Session G -- implicit-function backward with the opacity path);
+        grad_radii, grad_kernel_times, grad_ranges, and grad_gidx are unused
         (non-differentiable outputs).
         Returns gradients for (means3D, means2D, sh, colors_precomp, opacities, scales, rotations, None).
         """
@@ -114,7 +116,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
-        colors_precomp, means3D, scales, rotations, radii, sh, opacities, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
+        colors_precomp, means3D, scales, rotations, radii, sh, opacities, geomBuffer, binningBuffer, imgBuffer, median_depth = ctx.saved_tensors
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
@@ -133,8 +135,10 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.tanfovx, 
                 raster_settings.tanfovy, 
                 grad_out_color,
-                grad_out_depth, 
-                sh, 
+                grad_out_depth,
+                median_depth,
+                grad_median_depth if grad_median_depth is not None else torch.zeros(0, device=means3D.device),
+                sh,
                 raster_settings.sh_degree, 
                 raster_settings.campos,
                 geomBuffer,

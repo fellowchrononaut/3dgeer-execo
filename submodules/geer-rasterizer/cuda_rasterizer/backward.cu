@@ -15,6 +15,13 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
+// Session G: asymmetric damping for the median-depth implicit backward,
+// ported from GaussianWrapping diff-gaussian-rasterization_ours config.h:32-33.
+// Positive t_delta = gaussian in FRONT of the crossing; its shape gradient is
+// damped 1000x (the opacity relief-valve term handles it instead).
+constexpr float TDELTA_POSITIVE_GRAD_MUL = 0.001f;
+constexpr float TDELTA_NEGATIVE_GRAD_MUL = 1.0f;
+
 //// IMPLEMENTATION OF THE 3DGEER BACKWARD FUNCTION
 // Backward pass for the conversion of scale and rotation to the inversed Cov3Ds. 
 __device__ void computeWorldToObject(int idx, const glm::vec3 scale, float mod, const glm::vec4 rot, glm::mat3 dL_dMt_inv, glm::vec3* dL_dscales, glm::vec4* dL_drots, float& dL_dhvar, float h_var) {
@@ -304,6 +311,8 @@ renderCUDA(
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_invdepths,
+	const float* __restrict__ median_depth,
+	const float* __restrict__ dL_dmedian,
 	float3* __restrict__ dL_dmean2D,
 	glm::vec3* __restrict__ dL_dmeans,
 	float* __restrict__ dL_dopacity,
@@ -374,6 +383,87 @@ renderCUDA(
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
 		if(dL_invdepths)
 		dL_invdepth = dL_invdepths[pix_id];
+	}
+
+	// ------------------------------------------------------------------
+	// Session G PASS 1: median-depth implicit-function sensitivity.
+	// t_m solves T(t_m)=0.5 under T(t) = prod_i (1 - a_i G_i(t)),
+	// G_i(t) = exp(-0.5((t - t*_i) rsigma_i)^2). Accumulate
+	// dT_dtm := d(logT)/dt_m over all contributors (order-independent),
+	// then dL/dt_m is divided by it (implicit function theorem). PASS 2
+	// in the main loop below distributes per-Gaussian shares. Formulas
+	// ported from GW diff-gaussian-rasterization_ours render_backward.cu
+	// (~lines 832-1006), re-expressed in 3DGEER's exact per-ray
+	// quantities: t* = dot(p_obj,d_obj)/|d_obj|^2, rsigma = |d_obj|.
+	// ------------------------------------------------------------------
+	const float rayf_norm = sqrtf(dot(rayf, rayf));
+	float t_m = 0.f;
+	float dL_dmt_dT_dtm = 0.f;
+	bool med_active = false;
+	if (inside && dL_dmedian != nullptr) {
+		const float md_e = median_depth[pix_id];
+		if (md_e > 0.f && dL_dmedian[pix_id] != 0.f) {
+			med_active = true;
+			t_m = md_e / rayf_norm;
+		}
+	}
+	if (__syncthreads_or((int)med_active)) {
+		float dT_dtm = 0.f;
+		int med_toDo = range.y - range.x;
+		int med_idx = 0;
+		bool med_done = !med_active;
+		for (int i = 0; i < rounds; i++, med_toDo -= BLOCK_SIZE) {
+			block.sync();
+			const int progress = i * BLOCK_SIZE + block.thread_rank();
+			if (range.x + progress < range.y) {
+				// FRONT-to-back (opposite of the main loop below)
+				const int coll_id = point_list[range.x + progress];
+				const int thread_idx = block.thread_rank();
+				collected_id[thread_idx] = coll_id;
+				collected_xyz[thread_idx] = points_xyz_view[coll_id];
+				collected_h_opacity[thread_idx] = h_opacity[coll_id];
+				for (int jj = 0; jj < 3; jj++)
+					collected_w2o[thread_idx * 3 + jj] = w2o[coll_id * 3 + jj];
+			}
+			block.sync();
+			for (int j = 0; !med_done && j < min(BLOCK_SIZE, med_toDo); j++) {
+				if (med_idx >= last_contributor) { med_done = true; continue; }
+				med_idx++;
+				const float3 xyz_m = collected_xyz[j];
+				const float2 h_o_m = collected_h_opacity[j];
+				float3* w2o_rows_m = collected_w2o + j * 3;
+				const float3 p_obj_m = { dot(xyz_m, w2o_rows_m[0]), dot(xyz_m, w2o_rows_m[1]), dot(xyz_m, w2o_rows_m[2]) };
+				const float3 d_obj_m = { dot(rayf, w2o_rows_m[0]), dot(rayf, w2o_rows_m[1]), dot(rayf, w2o_rows_m[2]) };
+				const float3 normal_m = cross(d_obj_m, p_obj_m);
+				const float dns_m = dot(d_obj_m, d_obj_m);
+				const float D2_m = dot(normal_m, normal_m) / dns_m;
+				const float pm_m = -0.5f * D2_m;
+				if (pm_m > 0.0f) continue;
+				const float G_m = exp(pm_m);
+				const float a_m = min(0.99f, h_o_m.y * G_m);
+				if (a_m < 1.0f / 255.0f) continue;
+				const float rsigma_m = sqrtf(dns_m);
+				const float t_star_m = dot(p_obj_m, d_obj_m) / dns_m;
+				// NaN/Inf hardening (found on real 8M-gaussian data, 2026-07-08):
+				// degenerate d_obj makes t_star huge/inf -> t_delta inf ->
+				// G_exp = exp(-inf) = 0 but Gt*|t_delta| = 0*inf = NaN, which
+				// poisons dT_dtm (and fmaxf then silently swallows the NaN
+				// into the 1e-7 clamp = 1e7x amplifier). Skip non-finite,
+				// clamp the rest; beyond |t_delta|=60 the contribution is
+				// exp(-1800) = 0 exactly in fp32, so semantics are unchanged.
+				float t_delta_m = (t_m - t_star_m) * rsigma_m;
+				if (!isfinite(t_delta_m)) continue;
+				t_delta_m = fmaxf(-60.f, fminf(60.f, t_delta_m));
+				const float G_exp_m = expf(-0.5f * t_delta_m * t_delta_m);
+				const float Gt_m = a_m * G_exp_m;
+				if (rsigma_m > 0.f) {
+					const float dmul_m = (t_delta_m > 0.f) ? TDELTA_POSITIVE_GRAD_MUL : TDELTA_NEGATIVE_GRAD_MUL;
+					dT_dtm += -0.5f * dmul_m * Gt_m / (1.f - Gt_m) * fabsf(t_delta_m) * rsigma_m;
+				}
+			}
+		}
+		if (med_active)
+			dL_dmt_dT_dtm = (dL_dmedian[pix_id] * rayf_norm) / fmaxf(-dT_dtm, 1e-7f);
 	}
 
 	float last_alpha = 0;
@@ -489,6 +579,50 @@ renderCUDA(
 				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
 			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
+			// Session G PASS 2: this Gaussian's share of the median-depth
+			// gradient (GW render_backward.cu:986-1006 ported to exact
+			// per-ray quantities). dL_dopa_sigma joins dL_dalpha UNSCALED
+			// by T (GW adds it after their dL_dopa *= T): it flows into
+			// dL_dopacity AND, via dL_dG, into the footprint chain, exactly
+			// as in GW. dL_dt_star / dL_drsigma join dL_dpobj / dL_ddobj
+			// below via the exact partials of t* = dot(p,d)/|d|^2, rsigma=|d|.
+			float3 dL_dpobj_med = { 0.f, 0.f, 0.f };
+			float dL_ddobj_med[3] = { 0.f, 0.f, 0.f };
+			if (med_active) {
+				const float rsigma = sqrtf(dobj_norm_sq);
+				const float t_star = dot(p_obj, d_obj) / dobj_norm_sq;
+				// NaN/Inf hardening -- mirror of PASS 1 (see comment there);
+				// non-finite t_delta = degenerate geometry, contributes
+				// nothing (the med contributions stay zero-initialized).
+				float t_delta = (t_m - t_star) * rsigma;
+				if (isfinite(t_delta)) {
+				t_delta = fmaxf(-60.f, fminf(60.f, t_delta));
+				const float G_exp_med = expf(-0.5f * t_delta * t_delta);
+				const float Gt = alpha * G_exp_med;
+				float dL_dGt = 0.f;
+				if (rsigma > 0.f) {
+					const float sgn = (t_delta > 0.f) ? 1.f : -1.f;
+					const float dmul = (t_delta > 0.f) ? TDELTA_POSITIVE_GRAD_MUL : TDELTA_NEGATIVE_GRAD_MUL;
+					dL_dGt = sgn * dmul * dL_dmt_dT_dtm * 0.5f / (1.f - Gt);
+				}
+				const float dL_dopa_sigma = dL_dGt * G_exp_med
+					- dL_dmt_dT_dtm * ((t_delta > 0.f) ? 0.5f / (1.f - alpha) : 0.f);
+				const float dL_ddelta = -dL_dGt * Gt * t_delta;
+				// (t_m - t_star) rewritten as t_delta/rsigma so the clamped,
+				// finite value is used; identical when unclamped.
+				const float dL_drsigma = dL_ddelta * (t_delta / rsigma);
+				const float dL_dt_star = -dL_ddelta * rsigma;
+				dL_dalpha += dL_dopa_sigma;
+				const float inv_dns = 1.f / dobj_norm_sq;
+				dL_dpobj_med.x = dL_dt_star * d_obj.x * inv_dns;
+				dL_dpobj_med.y = dL_dt_star * d_obj.y * inv_dns;
+				dL_dpobj_med.z = dL_dt_star * d_obj.z * inv_dns;
+				dL_ddobj_med[0] = dL_dt_star * (p_obj.x - 2.f * t_star * d_obj.x) * inv_dns + dL_drsigma * d_obj.x / rsigma;
+				dL_ddobj_med[1] = dL_dt_star * (p_obj.y - 2.f * t_star * d_obj.y) * inv_dns + dL_drsigma * d_obj.y / rsigma;
+				dL_ddobj_med[2] = dL_dt_star * (p_obj.z - 2.f * t_star * d_obj.z) * inv_dns + dL_drsigma * d_obj.z / rsigma;
+				}
+			}
+
 
 			// Helpful reusable temporary variables
 			const float dL_dG = h_o.y * dL_dalpha;
@@ -500,6 +634,10 @@ renderCUDA(
 			dL_dpobj.x = dL_dnormal.y * d_obj.z - dL_dnormal.z * d_obj.y;
 			dL_dpobj.y = dL_dnormal.z * d_obj.x - dL_dnormal.x * d_obj.z;
 			dL_dpobj.z = dL_dnormal.x * d_obj.y - dL_dnormal.y * d_obj.x;
+
+			dL_dpobj.x += dL_dpobj_med.x;
+			dL_dpobj.y += dL_dpobj_med.y;
+			dL_dpobj.z += dL_dpobj_med.z;
 
 			atomicAdd(&dL_dmeans[global_id].x, dL_dpobj.x);
 			atomicAdd(&dL_dmeans[global_id].y, dL_dpobj.y);
@@ -514,6 +652,10 @@ renderCUDA(
 			dL_ddobj[0] = 2.f * dL_ddenom * d_obj.x - dL_dnormal.y * p_obj.z + dL_dnormal.z * p_obj.y;
 			dL_ddobj[1] = 2.f * dL_ddenom * d_obj.y - dL_dnormal.z * p_obj.x + dL_dnormal.x * p_obj.z;
 			dL_ddobj[2] = 2.f * dL_ddenom * d_obj.z - dL_dnormal.x * p_obj.y + dL_dnormal.y * p_obj.x;
+
+			dL_ddobj[0] += dL_ddobj_med[0];
+			dL_ddobj[1] += dL_ddobj_med[1];
+			dL_ddobj[2] += dL_ddobj_med[2];
 			// Atomic addition component-wise
 			#pragma unroll
 			for (int i = 0; i < 3; i++) {
@@ -608,8 +750,10 @@ void BACKWARD::render(
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
 	const float* dL_invdepths,
+	const float* median_depth,
+	const float* dL_dmedian,
 	float3* dL_dmean2D,
-	glm::vec3* dL_dmean3D,  
+	glm::vec3* dL_dmean3D,
 	float* dL_dopacity,
 	float* dL_dcolors,
 	float* dL_dinvdepths,
@@ -633,8 +777,10 @@ void BACKWARD::render(
 		n_contrib,
 		dL_dpixels,
 		dL_invdepths,
+		median_depth,
+		dL_dmedian,
 		dL_dmean2D,
-		dL_dmean3D, 
+		dL_dmean3D,
 		dL_dopacity,
 		dL_dcolors,
 		dL_dinvdepths,

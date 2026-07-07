@@ -57,6 +57,55 @@ MULTIVIEW_NCC_ANALYTIC_PRECISE = _os.environ.get("MULTIVIEW_NCC_ANALYTIC_PRECISE
 _NCC_LAST_CAPTURE = None  # rolling input snapshot for the IMA capture mode
 
 
+def expected_depth_from_invdepth(invdepth: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert the differentiable expected inverse-depth render to ray depth.
+
+    Empty/sky pixels render zero inverse depth. Keep those pixels at depth 0
+    and return a validity mask so callers never feed huge reciprocal depths
+    into the multiview geometry.
+
+    WARNING: not a surface depth — do NOT use as the multiview reference.
+    expected_invdepth is a harmonic-style blend over every Gaussian on the
+    ray, over-weighting faint near floaters by 1/d; on sessD_full30k it
+    deviates from the median-depth surface by p50 19% / p90 54%, and wiring
+    it into the multiview losses collapsed training (sessF2_mv_r1_fix
+    post-mortem, 3DGEERGW_EXECUTION.md 2026-07-07). Use
+    straight_through_median_depth instead.
+    """
+    valid = invdepth > eps
+    depth = torch.where(valid, 1.0 / invdepth.clamp_min(eps), torch.zeros_like(invdepth))
+    return depth, valid
+
+
+def straight_through_median_depth(
+    median_depth: torch.Tensor,          # (1,H,W) rasterized T=0.5 depth, non-diff
+    gidx: torch.Tensor,                  # (H,W) int32 crossing-gaussian id, -1 = none
+    xyz: torch.Tensor,                   # (P,3) differentiable gaussian centers, world
+    world_view_transform: torch.Tensor,  # (4,4) row-vector convention
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SUPERSEDED (Session G): the rasterizer's median_depth is now natively
+    differentiable with GW's implicit-function backward incl. the opacity
+    path; production train.py no longer calls this. Kept for tests and as
+    the record of the fix2/fix3 investigation.
+
+    Differentiable median depth via a straight-through estimator.
+
+    Value: the exact rasterized median depth (bias-free surface measurement).
+    Gradient: routed through the T=0.5-crossing gaussian's view-space center
+    distance, which tracks median depth to p50 0.2-0.6% / p90 2-4%
+    (_diag_st_median.py) and responds 1:1 to moving that gaussian along the
+    ray — first-order correct exactly where the multiview losses act.
+    Returns (depth (1,H,W), valid (1,H,W) bool); invalid pixels (no crossing,
+    or zero depth) carry no gradient.
+    """
+    d_center = (xyz @ world_view_transform[:3, :3] + world_view_transform[3, :3]).norm(dim=-1)  # (P,)
+    crossed = gidx >= 0
+    d_sel = d_center[gidx.clamp_min(0).long()]                            # (H,W)
+    depth = median_depth + ((d_sel - d_sel.detach()) * crossed).unsqueeze(0)
+    valid = crossed.unsqueeze(0) & (median_depth > 0)
+    return depth, valid
+
+
 # ---------------------------------------------------------------------------
 # compute_nearest_cameras -- pure extrinsics geometry, ported near-verbatim
 # from multiview_gggs.py:19-83. Deviation from the original: this version
@@ -134,26 +183,35 @@ ref_to_neighbor_RT = _ref_to_neighbor_RT
 # PatchMatch.__call__'s geo-consistency term (:91-153, :196-260), using
 # get_ray_dirs_view for unprojection and project_view_to_pixel for
 # reprojection instead of GW's raw perspective-divide (Fx/Fy/Cx/Cy) formulas,
-# so this works for EQ as well as PH. Per the brief's expected_depth note:
-# GW's own "ours" renderer sets expected_depth == median_depth, so we use
-# median_depth directly on both sides (no depth_ratio blend needed).
+# so this works for EQ as well as PH. Reference-side depth must be the
+# differentiable expected ray depth; the neighbor depth map is sampled as a
+# no-grad median-depth measurement.
 # ---------------------------------------------------------------------------
 def geo_loss(
     ref_cam,
     neighbor_cam,
-    ref_render_pkg: Dict[str, torch.Tensor],
+    ref_depth: torch.Tensor,
     neighbor_render_pkg: Dict[str, torch.Tensor],
+    ref_depth_valid: torch.Tensor,
     pixel_noise_th: float = 1.0,
     znear_relative: float = 0.02,
     scene_radius: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Returns (geo_loss scalar, mask (H,W) bool, weights (H,W) float)."""
+    """Returns (geo_loss scalar, mask (H,W) bool, weights (H,W) float).
+
+    ref_depth is the differentiable median depth (Session G native backward).
+    neighbor median depth remains the no-grad cross-view measurement.
+    """
     H, W = ref_cam.image_height, ref_cam.image_width
-    device = ref_render_pkg["median_depth"].device
+    device = ref_depth.device
     znear = znear_relative * scene_radius
+    if ref_depth.dim() == 2:
+        ref_depth = ref_depth.unsqueeze(0)
+    if ref_depth_valid.dim() == 2:
+        ref_depth_valid = ref_depth_valid.unsqueeze(0)
 
     dirs_ref = get_ray_dirs_view(ref_cam)                       # (3,H,W)
-    depth_ref = ref_render_pkg["median_depth"]                  # (1,H,W)
+    depth_ref = ref_depth                                       # (1,H,W)
     pts_ref_view = (dirs_ref * depth_ref).permute(1, 2, 0).reshape(-1, 3)  # (H*W,3)
 
     R_rn, T_rn = _ref_to_neighbor_RT(ref_cam, neighbor_cam)
@@ -166,7 +224,7 @@ def geo_loss(
     gy = (2.0 * v_n + 1.0) / Hn - 1.0
     grid = torch.stack([gx, gy], dim=-1).view(1, -1, 1, 2)
 
-    neighbor_depth = neighbor_render_pkg["median_depth"]        # (1,Hn,Wn)
+    neighbor_depth = neighbor_render_pkg["median_depth"].detach()  # (1,Hn,Wn)
     sampled_depth = F.grid_sample(
         neighbor_depth[None], grid, mode="bilinear", padding_mode="border", align_corners=False
     ).view(-1)
@@ -189,9 +247,16 @@ def geo_loss(
         torch.arange(W, device=device, dtype=torch.float32),
         indexing="ij",
     )
-    pixel_noise = torch.sqrt((u_back - xs.reshape(-1)) ** 2 + (v_back - ys.reshape(-1)) ** 2)
+    # +1e-12 under the sqrt: d(sqrt)/dx at exactly 0 is +inf, so pixels whose
+    # reprojection round-trip is EXACT (pixel_noise == 0, inside the mask by
+    # definition) emit NaN gradients into the differentiable ref depth. GW is
+    # immune because torch.pairwise_distance carries eps=1e-6
+    # (multiview_gggs.py / GGGS loss_utils.py); our raw-sqrt port lost that.
+    # Found 2026-07-08 poisoning xyz grads on real data (_diag_grad_scale.py).
+    pixel_noise = torch.sqrt((u_back - xs.reshape(-1)) ** 2 + (v_back - ys.reshape(-1)) ** 2 + 1e-12)
 
     depth_ref_flat = depth_ref.view(-1)
+    depth_ref_valid_flat = ref_depth_valid.view(-1)
     mask = (
         valid_proj
         & valid_back
@@ -199,9 +264,12 @@ def geo_loss(
         & (pts_neighbor_from_depth.norm(dim=-1) > znear)
         & (pts_back_ref_view.norm(dim=-1) > znear)
         & (pixel_noise < pixel_noise_th)
+        & depth_ref_valid_flat
         & (depth_ref_flat > 0)
     )
-    weights = torch.exp(-pixel_noise)
+    # GGGS computes weights + mask under torch.no_grad (loss_utils.py:210-218);
+    # keep them constants so the geo gradient is linear in pixel_noise.
+    weights = torch.exp(-pixel_noise.detach())
     weights = torch.where(mask, weights, torch.zeros_like(weights))
 
     if not bool(mask.any()):
