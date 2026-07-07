@@ -56,15 +56,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # pure extrinsics geometry (see utils/multiview.py::compute_nearest_cameras).
     multiview_nearest_cameras = None
     if opt.multiview:
-        assert opt.multiview_from_iter >= opt.normal_from_iter, (
-            "opt.multiview_from_iter must be >= opt.normal_from_iter: the multiview "
-            "loss reuses the L_N block's already-rendered world-space normal_map "
-            "instead of rendering it a second time (see train.py's per-iteration loop)."
-        )
-        assert opt.normal_weight > 0, (
-            "opt.multiview requires opt.normal_weight > 0 -- the multiview loss reuses "
-            "the L_N block's normal_map, which is only computed when normals are active."
-        )
         multiview_nearest_cameras = compute_nearest_cameras(
             scene.getTrainCameras(),
             scene_radius=scene.cameras_extent,
@@ -94,6 +85,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_LN_for_log = 0.0
     ema_ncc_for_log = 0.0
     ema_geo_for_log = 0.0
+    ema_flatten_for_log = 0.0
 
     # Pre-compute viewer extra params so MiniCam uses the correct render mode.
     _render_model_map = {"BEAP": 0, "KB": 1, "EQ": 1, "PH": 2}
@@ -197,9 +189,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = 0
 
         # --- GW surface-alignment losses ---
+        median_depth = render_pkg["median_depth"]                # (1,H,W), no grad path
         L_N = torch.zeros((), device="cuda"); L_DN = torch.zeros((), device="cuda")
+        shape_map = None
         if iteration >= opt.normal_from_iter and opt.normal_weight > 0:
-            median_depth = render_pkg["median_depth"]            # (1,H,W), no grad path
             with torch.no_grad():
                 target_n_view, valid = depth_to_normals_via_rays(viewpoint_cam, median_depth)
                 target_n_world = view_normals_to_world(viewpoint_cam, target_n_view)
@@ -239,10 +232,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 cv2.imwrite(os.path.join(dump_dir, f'iter_{iteration:06d}_depth.png'), depth_sv)
 
         # --- GaussianWrapping multiview NCC+geo consistency (Session F2) ---
-        # Reuses this iteration's already-rendered `normal_map` (world-space,
-        # from the L_N block above) and `median_depth` -- structurally requires
-        # iteration >= opt.normal_from_iter, enforced by the opt.multiview_from_iter
-        # >= opt.normal_from_iter assert at startup.
+        # Uses SHAPE normals (render_normal_field(..., shape=True)), decoupled
+        # from L_N's learned-normal/normal_from_iter schedule so multiview can
+        # be active as early as iter 7000 regardless of when L_N/L_DN start.
+        # Reuses `median_depth` from render_pkg (always available) and, if the
+        # L_DN pass above already rendered a shape map this iteration (only
+        # when iteration >= opt.normal_from_iter and opt.depth_normal_weight >
+        # 0), reuses it instead of rendering a second time.
         L_MV = torch.zeros((), device="cuda")
         ncc_loss_val = torch.zeros((), device="cuda")
         geo_loss_val = torch.zeros((), device="cuda")
@@ -262,7 +258,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 )
 
                 if geo_mask.any():
-                    normal_map_view = world_to_view_normals(viewpoint_cam, normal_map)  # (3,H,W)
+                    if shape_map is None:
+                        shape_map = render_normal_field(viewpoint_cam, gaussians, pipe, shape=True)
+                    normal_map_view = world_to_view_normals(viewpoint_cam, shape_map)  # (3,H,W)
                     Hc, Wc = viewpoint_cam.image_height, viewpoint_cam.image_width
                     ys_mv, xs_mv = torch.meshgrid(
                         torch.arange(Hc, device="cuda"), torch.arange(Wc, device="cuda"), indexing="ij"
@@ -300,6 +298,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 L_MV = opt.multiview_ncc_weight * ncc_loss_val + opt.multiview_geo_weight * geo_loss_val
                 loss = loss + L_MV
 
+        # --- GW gaussian flattening loss (F2 completion; default OFF) ---
+        L_flatten = torch.zeros((), device="cuda")
+        flatten_active = opt.flatten_weight > 0 and iteration >= opt.flatten_from_iter
+        if flatten_active:
+            L_flatten = (gaussians.get_scaling.min(dim=-1).values / gaussians.spatial_lr_scale).mean()
+            loss = loss + opt.flatten_weight * L_flatten
+
         loss.backward()
 
         iter_end.record()
@@ -314,6 +319,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if multiview_active:
                 ema_ncc_for_log = 0.4 * ncc_loss_val.item() + 0.6 * ema_ncc_for_log
                 ema_geo_for_log = 0.4 * geo_loss_val.item() + 0.6 * ema_geo_for_log
+            if flatten_active:
+                ema_flatten_for_log = 0.4 * L_flatten.item() + 0.6 * ema_flatten_for_log
 
             if iteration % 10 == 0:
                 postfix = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"}
@@ -322,6 +329,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if multiview_active:
                     postfix["ncc"] = f"{ema_ncc_for_log:.{7}f}"
                     postfix["geo"] = f"{ema_geo_for_log:.{7}f}"
+                if flatten_active:
+                    postfix["flat"] = f"{ema_flatten_for_log:.{7}f}"
                 progress_bar.set_postfix(postfix)
                 progress_bar.update(10)
             if iteration == opt.iterations:
@@ -335,6 +344,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_writer.add_scalar('train_loss/ncc_loss', ncc_loss_val.item(), iteration)
                 tb_writer.add_scalar('train_loss/geo_loss', geo_loss_val.item(), iteration)
                 tb_writer.add_scalar('train_loss/L_MV', L_MV.item(), iteration)
+            if tb_writer and flatten_active:
+                tb_writer.add_scalar('train_loss/L_flatten', L_flatten.item(), iteration)
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), dataset.train_test_exp, valid_mask)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -346,7 +357,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                under_cap = opt.max_gaussians <= 0 or gaussians.get_xyz.shape[0] < opt.max_gaussians
+                if under_cap and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
 
@@ -355,7 +367,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Wrapping densification (GW schedule: discrete rounds after normal
             # convergence, decoupled from the standard densification epochs).
-            if (iteration >= opt.densify_and_wrap_from_iter
+            under_cap = opt.max_gaussians <= 0 or gaussians.get_xyz.shape[0] < opt.max_gaussians
+            if (under_cap
+                    and iteration >= opt.densify_and_wrap_from_iter
                     and iteration <= opt.densify_and_wrap_until_iter
                     and iteration % opt.densify_and_wrap_interval == 0):
                 n_wrapped = gaussians.densify_and_wrap(opt.normal_error_threshold, opt.wrap_quantile)

@@ -129,6 +129,12 @@ class OptimizationParams(ParamGroup):
         self.multiview_min_dis_relative = 0.002    # GW: multi_view_min_dis_relative
         self.multiview_max_dis_relative = 0.3      # GW: multi_view_max_dis_relative
         self.multiview_znear_relative = 0.02       # relative to scene radius (GW uses znear_relative similarly)
+        # --- F2 completion: flatten loss, gaussian cap, GW feature LRs ---
+        self.flatten_weight = 0.0            # GW gaussian_flattening_loss weight; 0.0 = OFF
+        self.flatten_from_iter = 7000        # flatten loss active from this iter (when flatten_weight > 0)
+        self.max_gaussians = 0               # cap on gaussian count; 0 = off (no growth gating)
+        self.feature_dc_lr = 0.0             # override for f_dc param-group LR; 0.0 = use feature_lr
+        self.feature_rest_lr = 0.0           # override for f_rest param-group LR; 0.0 = use feature_lr/20
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

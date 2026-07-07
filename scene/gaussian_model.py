@@ -213,10 +213,16 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
+        # GW feature LR overrides (Session F2 completion): default 0.0 means
+        # "use the existing feature_lr(/20) behavior", so this is a no-op at
+        # defaults and bit-identical to pre-F2-completion training_setup.
+        feature_dc_lr = training_args.feature_dc_lr if training_args.feature_dc_lr > 0 else training_args.feature_lr
+        feature_rest_lr = training_args.feature_rest_lr if training_args.feature_rest_lr > 0 else training_args.feature_lr / 20.0
+
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
-            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+            {'params': [self._features_dc], 'lr': feature_dc_lr, "name": "f_dc"},
+            {'params': [self._features_rest], 'lr': feature_rest_lr, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
