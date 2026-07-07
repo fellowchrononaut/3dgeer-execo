@@ -46,8 +46,25 @@ __device__ __forceinline__ Float3 matvec3(const float* R, const Float3& v) {
 // project (pixel i is centered at continuous coordinate i, see
 // fisheye_proj.py's module docstring / project_view_to_pixel's "-0.5" terms).
 __device__ __forceinline__ float bilinear_sample(const float* img, int H, int W, float u, float v) {
-    int x0 = static_cast<int>(floorf(u));
-    int y0 = static_cast<int>(floorf(v));
+    // Bound the FLOAT into [-2, W] / [-2, H] BEFORE the int conversion. The
+    // previous form (convert -> x1 = x0 + 1 -> int clamps) was UB for
+    // u ~ +/-huge or NaN: cvt saturates x0 to INT_MAX/INT_MIN, x0 + 1 is
+    // signed-overflow UB, and -O3 legally elided the subsequent clamp ->
+    // INT_MIN-scale index -> the 2026-07-07 training IMA (compute-sanitizer:
+    // invalid read at old line 64, offset exactly -2^31 * 4 bytes). The
+    // `!(x >= lo)` form also catches NaN (all comparisons false). For every
+    // finite u in (-2, W) -- which covers the whole proj_valid band -- the
+    // corner/weight semantics below are BYTE-IDENTICAL to the original
+    // (raw-coordinate weights + per-corner int clamps), so the analytic
+    // backward's oracle-validated border behavior is preserved.
+    float uf = floorf(u);
+    float vf = floorf(v);
+    if (!(uf >= -2.0f)) uf = -2.0f;          // NaN / -inf / -huge
+    if (!(uf <= (float)W)) uf = (float)W;    // +inf / +huge
+    if (!(vf >= -2.0f)) vf = -2.0f;
+    if (!(vf <= (float)H)) vf = (float)H;
+    int x0 = static_cast<int>(uf);
+    int y0 = static_cast<int>(vf);
     int x1 = x0 + 1;
     int y1 = y0 + 1;
     float wx1 = u - static_cast<float>(x0);
@@ -346,8 +363,17 @@ __device__ __forceinline__ bool project_eq_identity(
 
 template <typename T>
 __device__ __forceinline__ T bilinear_sample_t(const float* img, int H, int W, T u, T v) {
-    int x0 = static_cast<int>(floor(u));
-    int y0 = static_cast<int>(floor(v));
+    // Same UB fix as the forward's bilinear_sample (see its comment): bound
+    // the float into [-2, W]/[-2, H] before the int conversion; semantics
+    // byte-identical to the original for the whole proj_valid band.
+    T uf = floor(u);
+    T vf = floor(v);
+    if (!(uf >= T(-2))) uf = T(-2);
+    if (!(uf <= T(W))) uf = T(W);
+    if (!(vf >= T(-2))) vf = T(-2);
+    if (!(vf <= T(H))) vf = T(H);
+    int x0 = static_cast<int>(uf);
+    int y0 = static_cast<int>(vf);
     int x1 = x0 + 1;
     int y1 = y0 + 1;
     T wx1 = u - (T)x0;
@@ -368,8 +394,15 @@ __device__ __forceinline__ T bilinear_sample_t(const float* img, int H, int W, T
 template <typename T>
 __device__ __forceinline__ void bilinear_sample_grad_t(
     const float* img, int H, int W, T u, T v, T& dc_du, T& dc_dv) {
-    int x0 = static_cast<int>(floor(u));
-    int y0 = static_cast<int>(floor(v));
+    // Same UB fix as bilinear_sample / bilinear_sample_t (see comments there).
+    T uf = floor(u);
+    T vf = floor(v);
+    if (!(uf >= T(-2))) uf = T(-2);
+    if (!(uf <= T(W))) uf = T(W);
+    if (!(vf >= T(-2))) vf = T(-2);
+    if (!(vf <= T(H))) vf = T(H);
+    int x0 = static_cast<int>(uf);
+    int y0 = static_cast<int>(vf);
     int x1 = x0 + 1;
     int y1 = y0 + 1;
     T wx1 = u - (T)x0;

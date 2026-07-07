@@ -21,7 +21,8 @@ setup(
                 "ext.cpp"],
             extra_compile_args={"nvcc": [
                 "-O3",
-                "--use_fast_math"]})
+                "--use_fast_math",
+                "-lineinfo"]})
     ],
     cmdclass={
         'build_ext': BuildExtension

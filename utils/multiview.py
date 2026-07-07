@@ -54,6 +54,7 @@ MULTIVIEW_NCC_BACKWARD = _os.environ.get("MULTIVIEW_NCC_BACKWARD", "fd")
 assert MULTIVIEW_NCC_BACKWARD in ("fd", "analytic"), \
     f"MULTIVIEW_NCC_BACKWARD must be 'fd' or 'analytic', got {MULTIVIEW_NCC_BACKWARD!r}"
 MULTIVIEW_NCC_ANALYTIC_PRECISE = _os.environ.get("MULTIVIEW_NCC_ANALYTIC_PRECISE", "1") != "0"
+_NCC_LAST_CAPTURE = None  # rolling input snapshot for the IMA capture mode
 
 
 # ---------------------------------------------------------------------------
@@ -363,11 +364,37 @@ class EQWarpPatchNCC(torch.autograd.Function):
                 "(pip install --no-build-isolation -e .)"
             )
 
+        # Debug instrumentation (2026-07-07 IMA hunt): MULTIVIEW_NCC_DEBUG=1
+        # passes debug=True to the extension (per-launch cudaDeviceSynchronize
+        # + error check, so a fault names THIS call instead of surfacing on
+        # the next innocent torch op); MULTIVIEW_NCC_CAPTURE=<path> snapshots
+        # every call's exact inputs to CPU and dumps the failing batch on
+        # RuntimeError for standalone compute-sanitizer replay.
+        _dbg = _os.environ.get("MULTIVIEW_NCC_DEBUG", "0") == "1"
+        _cap_path = _os.environ.get("MULTIVIEW_NCC_CAPTURE", "")
+
         def _fwd(d, n):
-            return _multiview_ncc_ext.multiview_ncc_forward(
-                d, n, uvs, ray_dirs_r, R, T, image_r, image_n,
-                render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius,
-            )
+            if _cap_path:
+                global _NCC_LAST_CAPTURE
+                _NCC_LAST_CAPTURE = {
+                    "depths": d.detach().cpu(), "normals": n.detach().cpu(),
+                    "uvs": uvs.detach().cpu(), "ray_dirs_r": ray_dirs_r.detach().cpu(),
+                    "R": R.detach().cpu(), "T": T.detach().cpu(),
+                    "image_r": image_r.detach().cpu(), "image_n": image_n.detach().cpu(),
+                    "render_model_n": render_model_n, "fx_n": fx_n, "fy_n": fy_n,
+                    "cx_n": cx_n, "cy_n": cy_n, "patch_radius": patch_radius,
+                }
+            try:
+                return _multiview_ncc_ext.multiview_ncc_forward(
+                    d, n, uvs, ray_dirs_r, R, T, image_r, image_n,
+                    render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius,
+                    _dbg,
+                )
+            except RuntimeError:
+                if _cap_path and _NCC_LAST_CAPTURE is not None:
+                    torch.save(_NCC_LAST_CAPTURE, _cap_path)
+                    print(f"[NCC-CAPTURE] failing batch saved to {_cap_path}", flush=True)
+                raise
 
         ncc, valid = _fwd(depths, normals)
 

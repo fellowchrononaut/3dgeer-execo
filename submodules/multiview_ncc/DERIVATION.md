@@ -223,6 +223,23 @@ derivation alone. Specific spots that were verified rather than trusted:
 
 ## 4. Non-differentiable boundaries and gradient masking
 
+> **2026-07-07 CVE-grade bug, fixed (all three bilinear helpers)**: the
+> original `int x0 = (int)floor(u); int x1 = x0 + 1;` was **signed-overflow
+> UB** when a degenerate plane intersection produced `u = ±huge/NaN` (cvt
+> saturates `x0` to `INT_MAX`/`INT_MIN`; `x0 + 1` is UB; `-O3` legally
+> elided the subsequent int clamp). Result: an `INT_MIN`-scale index → CUDA
+> illegal memory access, input-dependent and rare (~1 poisoned point per
+> 1e8+ evaluations; crashed three 30k training runs at iters 25,220 /
+> 21,060 / 26,500 before being pinned by input-capture + single-call
+> compute-sanitizer replay: `Invalid __global__ read`, offset exactly
+> `-2^31 * 4` bytes, old `multiview_ncc_impl.cu:64`). Fix: bound
+> `floor(u)` into `[-2, W]` (NaN-safe `!(x >= lo)` comparisons) BEFORE the
+> int conversion — semantics byte-identical to the original for the whole
+> `proj_valid` band (verified: full oracle suite unchanged, analytic
+> backward still <1% vs oracle), overflow impossible by construction.
+> Repro artifacts: `/home/output/ncc_failing_batch.pt` + `_replay_ncc.py`
+> pattern in the session log.
+
 The loss is **piecewise smooth**. Boundaries, and what the backward does:
 
 1. **Patch bbox** (ref patch would leave the reference image): forward
