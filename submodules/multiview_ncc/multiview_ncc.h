@@ -33,6 +33,27 @@ MultiviewNCC(const torch::Tensor& depths,       // (P,) float, ref median depth 
              const int patch_radius,
              const bool debug);
 
+// Phase 2 analytic backward -- see cuda_multiview_ncc/multiview_ncc_impl.cu
+// (multiview_ncc_backward_kernel) for the full chain-rule derivation.
+// Recomputes the forward pass internally (same inputs as MultiviewNCC above,
+// plus the upstream dL/dncc); returns (grad_depths (P,), grad_normals (P,3)).
+std::tuple<torch::Tensor, torch::Tensor>
+MultiviewNCCBackward(const torch::Tensor& depths,
+                      const torch::Tensor& normals,
+                      const torch::Tensor& uvs,
+                      const torch::Tensor& ray_dirs_r,
+                      const torch::Tensor& R,
+                      const torch::Tensor& T,
+                      const torch::Tensor& image_r,
+                      const torch::Tensor& image_n,
+                      const int render_model_n,
+                      const float fx_n, const float fy_n,
+                      const float cx_n, const float cy_n,
+                      const int patch_radius,
+                      const torch::Tensor& grad_ncc,
+                      const bool precise,
+                      const bool debug);
+
 // refer to Gaussian Splatting / warp_patch_ncc.h
 #define CHECK_CUDA(A, debug)                                                                                           \
     A;                                                                                                                 \

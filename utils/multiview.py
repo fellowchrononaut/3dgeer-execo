@@ -30,6 +30,31 @@ try:
 except ImportError:
     _HAVE_MULTIVIEW_NCC_EXT = False
 
+# Backward-mode switch for EQWarpPatchNCC (Phase 1 vs Phase 2, see
+# 3DGEERGW_EXECUTION.md Session F2 "backward-gradient strategy"):
+#   "fd"       -- Phase 1 finite-difference backward (9 forward kernel calls,
+#                 calibrated eps=3e-2; the validated production default).
+#   "analytic" -- Phase 2 hand-derived analytic backward (single CUDA
+#                 backward-kernel call, submodules/multiview_ncc
+#                 _C.multiview_ncc_backward; validated against the
+#                 pure-torch oracle autograd + the FD backward in
+#                 tests/test_multiview.py, but NOT the default pending the
+#                 A/B-run evidence + user decision).
+# Override without code changes via the environment variable
+# MULTIVIEW_NCC_BACKWARD=analytic|fd.
+#
+# MULTIVIEW_NCC_ANALYTIC_PRECISE (default "1") selects the analytic kernel's
+# internal precision: "1" = double (validated machine-exact vs a float64
+# oracle; roughly FD speed on consumer fp64-throttled GPUs), "0" = float
+# (several times faster; f32 noise floor, still far tighter than FD's
+# eps=3e-2 sign-agreement-grade gradients). Only consulted when the
+# backward mode is "analytic".
+import os as _os
+MULTIVIEW_NCC_BACKWARD = _os.environ.get("MULTIVIEW_NCC_BACKWARD", "fd")
+assert MULTIVIEW_NCC_BACKWARD in ("fd", "analytic"), \
+    f"MULTIVIEW_NCC_BACKWARD must be 'fd' or 'analytic', got {MULTIVIEW_NCC_BACKWARD!r}"
+MULTIVIEW_NCC_ANALYTIC_PRECISE = _os.environ.get("MULTIVIEW_NCC_ANALYTIC_PRECISE", "1") != "0"
+
 
 # ---------------------------------------------------------------------------
 # compute_nearest_cameras -- pure extrinsics geometry, ported near-verbatim
@@ -285,9 +310,12 @@ def ncc_reference_oracle(
 # submodules/warp-patch-ncc/warp_patch_ncc/__init__.py::_WarpPatchNCC -- its
 # ANALYTIC backward is what's being replaced here, not its overall shape.
 #
-# TODO Phase 2 (not implemented): hand-derive the full analytic EQ/PH
-# backward once Phase 1 is proven correct in real training, only if training
-# speed becomes an actual bottleneck. This finite-difference approach costs
+# Phase 2 (IMPLEMENTED, opt-in): the hand-derived analytic EQ/PH backward
+# now exists as _C.multiview_ncc_backward (see cuda_multiview_ncc/
+# multiview_ncc_impl.cu::multiview_ncc_backward_kernel for the derivation)
+# and is selected via MULTIVIEW_NCC_BACKWARD="analytic" (module constant /
+# env var above; default remains "fd" pending the A/B-run evidence + user
+# decision to flip). This finite-difference approach costs
 # ~9x the forward-kernel cost per active iteration (1 center + 2 depth + 6
 # normal-component evaluations via central differences), which was judged an
 # acceptable trade against the derivation-bug risk of hand-deriving a full
@@ -309,6 +337,21 @@ def ncc_reference_oracle(
 # gradient (verified by direct eps-sweep, not assumed).
 # ---------------------------------------------------------------------------
 class EQWarpPatchNCC(torch.autograd.Function):
+    """Backward mode is selected by the module-level MULTIVIEW_NCC_BACKWARD
+    constant (env-overridable, default "fd") read at forward() time:
+
+    - "fd" (Phase 1, production default): 9 forward-kernel calls at forward
+      time (center + central differences on depth and the 3 normal
+      components at the calibrated eps=3e-2 -- see the eps rationale in the
+      comment block above); backward is a cheap multiply with the stashed
+      FD gradients.
+    - "analytic" (Phase 2): single forward-kernel call at forward time;
+      backward calls the hand-derived analytic CUDA backward kernel
+      (_C.multiview_ncc_backward), which recomputes the forward reduction
+      per point and chains NCC -> patch stats -> bilinear -> PH/EQ
+      projection Jacobian -> ray-plane intersection analytically. Exact
+      (matches the pure-torch oracle's autograd to float32 noise), no eps.
+    """
     @staticmethod
     def forward(ctx, depths, normals, uvs, ray_dirs_r, R, T, image_r, image_n,
                  render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius,
@@ -328,6 +371,14 @@ class EQWarpPatchNCC(torch.autograd.Function):
 
         ncc, valid = _fwd(depths, normals)
 
+        mode = MULTIVIEW_NCC_BACKWARD
+        ctx.backward_mode = mode
+        if mode == "analytic":
+            ctx.kernel_args = (render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius)
+            ctx.save_for_backward(depths, normals, uvs, ray_dirs_r, R, T,
+                                  image_r, image_n)
+            return ncc, valid
+
         with torch.no_grad():
             ncc_dp, _ = _fwd(depths + eps_depth, normals)
             ncc_dm, _ = _fwd(depths - eps_depth, normals)
@@ -346,6 +397,20 @@ class EQWarpPatchNCC(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_ncc, grad_valid):
+        if ctx.backward_mode == "analytic":
+            (depths, normals, uvs, ray_dirs_r, R, T,
+             image_r, image_n) = ctx.saved_tensors
+            render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius = ctx.kernel_args
+            grad_depths, grad_normals = _multiview_ncc_ext.multiview_ncc_backward(
+                depths, normals, uvs, ray_dirs_r, R, T, image_r, image_n,
+                render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius,
+                grad_ncc.contiguous().float(),
+                precise=MULTIVIEW_NCC_ANALYTIC_PRECISE,
+            )
+            # The analytic kernel already multiplies by the upstream grad_ncc
+            # inside the kernel (g_upstream), so return its outputs directly.
+            return (grad_depths, grad_normals) + (None,) * 14
+
         grad_depths, grad_normals = ctx.saved_tensors
         # 16 forward inputs (depths, normals, uvs, ray_dirs_r, R, T, image_r,
         # image_n, render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius,

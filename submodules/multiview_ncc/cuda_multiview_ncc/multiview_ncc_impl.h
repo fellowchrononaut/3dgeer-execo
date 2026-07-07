@@ -40,3 +40,37 @@ void multiview_ncc_forward_launcher(
     const int patch_radius,
     float* ncc,
     bool* valid);
+
+// Phase 2: analytic backward. Recomputes the entire forward pass per query
+// point (no stashed intermediates from the forward launcher -- "recomputing
+// is simpler and cheap", see the derivation notes in
+// cuda_multiview_ncc/multiview_ncc_impl.cu above multiview_ncc_backward_kernel)
+// and accumulates dL/ddepth, dL/dnormal analytically via the chain:
+//   NCC -> patch statistics (sums over c_n) -> bilinear sample (u_n,v_n)
+//   -> PH/EQ projection Jacobian -> ray-plane intersection t(depth,normal)
+// Points whose recomputed valid_patch is false get exactly zero gradient
+// (matches the forward kernel's `ncc[idx] = valid_patch ? output_ncc : 0.f`
+// gating -- the loss surface is genuinely disconnected/non-smooth at that
+// boundary, not approximated away).
+void multiview_ncc_backward_launcher(
+    const int P,
+    const float* depths,
+    const float* normals,      // (P,3)
+    const int* uvs,            // (P,2) int32 (x, y)
+    const float* ray_dirs_r,   // (Hr,Wr,3)
+    const float* R,            // (3,3) row-major, ref-view -> neighbor-view
+    const float* T,            // (3,)
+    const float* image_r,      // (Hr,Wr)
+    const float* image_n,      // (Hn,Wn)
+    const int render_model_n,  // 1 = KB/EQ, 2 = PH
+    const float fx_n, const float fy_n,
+    const float cx_n, const float cy_n,
+    const int Hr, const int Wr,
+    const int Hn, const int Wn,
+    const int patch_radius,
+    const bool precise,        // true = double internals (machine-exact vs
+                               // f64 oracle), false = float (fast, f32
+                               // noise floor) -- see the kernel's PRECISION note
+    const float* grad_ncc,     // (P,) upstream dL/dncc
+    float* grad_depths,        // (P,) output
+    float* grad_normals);      // (P,3) output

@@ -31,6 +31,7 @@ from gaussian_wrapping.fields import view_to_world
 from gaussian_wrapping.fisheye_proj import project_view_to_pixel
 from utils.graphics_utils import getWorld2View2
 from utils.ray_normals import get_ray_dirs_view
+import utils.multiview as multiview_mod
 from utils.multiview import (
     ncc_reference_oracle,
     geo_loss,
@@ -305,6 +306,266 @@ def check_backward_vs_oracle_autograd(model_name, render_model, n_points=64, pat
           f"(sign agreement {gd_sign_agree:.2f}/{gn_sign_agree:.2f})")
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: analytic CUDA backward (_C.multiview_ncc_backward) checks.
+# ---------------------------------------------------------------------------
+
+def _backward_fixture(render_model, n_points, patch_radius, seed=7):
+    """Shared fixture for the backward checks: moderately-off query points
+    (+-40% depth, +-0.3 normal perturbation off the true flat-plane values)
+    -- same rationale as check_backward_vs_oracle_autograd's docstring: at
+    convergence the true gradient is legitimately ~0 and nothing meaningful
+    can be compared there."""
+    torch.manual_seed(seed)
+    ref_cam, neighbor_cam, image_r, image_n, depth_r, depth_n = build_flat_scene(render_model)
+    H, W = ref_cam.image_height, ref_cam.image_width
+    radius = patch_radius
+
+    xs = torch.randint(radius, W - radius, (n_points,), device="cuda")
+    ys = torch.randint(radius, H - radius, (n_points,), device="cuda")
+    pixels = torch.stack([xs, ys], dim=-1)
+
+    true_depths = depth_r[pixels[:, 1], pixels[:, 0]].contiguous()
+    depths0 = true_depths * (1.0 + 0.4 * (2 * torch.rand(n_points, device="cuda") - 1))
+    normals0 = torch.tensor([0.0, 0.0, -1.0], device="cuda").expand(n_points, 3).contiguous().clone()
+    normals0 += 0.3 * torch.randn(n_points, 3, device="cuda")
+
+    ray_dirs_r = get_ray_dirs_view(ref_cam).permute(1, 2, 0).contiguous()
+    R_rn, T_rn = _ref_to_neighbor_RT(ref_cam, neighbor_cam)
+    return (ref_cam, neighbor_cam, image_r, image_n, pixels, depths0, normals0,
+            ray_dirs_r, R_rn, T_rn)
+
+
+def check_analytic_backward_vs_oracle(model_name, render_model, n_points=256, patch_radius=3):
+    """Phase 2 validation (a): analytic CUDA backward vs the pure-torch
+    oracle's exact autograd gradient, on the same moderately-off fixture.
+
+    The oracle is run in FLOAT64 here (same f32 input values, upcast). This
+    is deliberate and was established empirically, not assumed: the analytic
+    kernel's internals are double precision (see the impl.cu rationale), so
+    it computes the exact derivative of the shared real-valued function; a
+    FLOAT32 oracle autograd carries its own rounding noise (grid_sample +
+    49-term reductions with cancellation) that shows up as a false-error
+    tail up to ~7% at small-|grad| points -- verified by comparing the f32
+    oracle against this same f64 oracle and observing the identical tail.
+    Comparing against f64 measures the kernel's actual error, not the
+    reference's.
+
+    Masked (excluded) points, and why each mask is legitimate:
+      - validity disagreement (oracle vs kernel valid flag): the loss is
+        gated to exactly 0 for invalid patches in both implementations;
+        gradient at the validity boundary is genuinely undefined.
+      - |grad_oracle| below the noise floor: relative error on a near-zero
+        denominator is uninformative (absolute agreement is still checked
+        for these via the abs-diff stat).
+      - bilinear-cell straddles: the sampled NCC is only piecewise-smooth in
+        (u_n, v_n) -- its derivative jumps at integer pixel boundaries of
+        the neighbor image. The one remaining f32-vs-f64 input difference
+        (R_rn/T_rn are consumed as f32 by the kernel but recomputed in f64
+        inside the oracle's camera algebra) can land u_n on opposite sides
+        of a boundary, making two exact-but-different-branch derivatives
+        disagree legitimately. Detected a-posteriori as isolated points
+        whose rel err is >>median (reported, must stay rare)."""
+    (ref_cam, neighbor_cam, image_r, image_n, pixels, depths0, normals0,
+     ray_dirs_r, R_rn, T_rn) = _backward_fixture(render_model, n_points, patch_radius)
+
+    # Oracle exact autograd in float64 (identical f32 input values, upcast).
+    wvt_r = ref_cam.world_view_transform
+    wvt_n = neighbor_cam.world_view_transform
+    rays_f32 = ref_cam._ray_dirs_view
+    ref_cam.world_view_transform = wvt_r.double()
+    neighbor_cam.world_view_transform = wvt_n.double()
+    ref_cam._ray_dirs_view = rays_f32.double()
+    try:
+        depths_o = depths0.double().clone().requires_grad_(True)
+        normals_o = normals0.double().clone().requires_grad_(True)
+        ncc_o, valid_o = ncc_reference_oracle(
+            ref_cam, neighbor_cam, depths_o, normals_o, pixels,
+            image_r.double(), image_n.double(), patch_radius=patch_radius,
+        )
+        ncc_o.sum().backward()
+        gd_o = depths_o.grad.float().clone()
+        gn_o = normals_o.grad.float().clone()
+        valid_o = valid_o.bool()
+    finally:
+        ref_cam.world_view_transform = wvt_r
+        neighbor_cam.world_view_transform = wvt_n
+        ref_cam._ray_dirs_view = rays_f32
+
+    # Analytic CUDA backward (grad_ncc = ones == d(sum ncc)/d(ncc)).
+    ncc_c, valid_c = multiview_ncc_ext.multiview_ncc_forward(
+        depths0, normals0, pixels.int(), ray_dirs_r, R_rn, T_rn, image_r, image_n,
+        neighbor_cam.render_model, neighbor_cam.focal_x, neighbor_cam.focal_y,
+        neighbor_cam.principal_x, neighbor_cam.principal_y, patch_radius,
+    )
+    gd_c, gn_c = multiview_ncc_ext.multiview_ncc_backward(
+        depths0, normals0, pixels.int(), ray_dirs_r, R_rn, T_rn, image_r, image_n,
+        neighbor_cam.render_model, neighbor_cam.focal_x, neighbor_cam.focal_y,
+        neighbor_cam.principal_x, neighbor_cam.principal_y, patch_radius,
+        torch.ones_like(ncc_c), precise=True,
+    )
+    # Fast (float-internals) variant: report-only stats against the same f64
+    # oracle. Expected profile (documented, not asserted tightly): median rel
+    # err ~1e-3 -- the noise floor of ANY f32 implementation of this gradient
+    # (the f32 reference oracle itself shows the same tail vs f64, verified
+    # during Phase-2 bring-up) -- with rare large outliers at bilinear-cell
+    # branch flips and small-|grad| cancellation points.
+    gd_f, gn_f = multiview_ncc_ext.multiview_ncc_backward(
+        depths0, normals0, pixels.int(), ray_dirs_r, R_rn, T_rn, image_r, image_n,
+        neighbor_cam.render_model, neighbor_cam.focal_x, neighbor_cam.focal_y,
+        neighbor_cam.principal_x, neighbor_cam.principal_y, patch_radius,
+        torch.ones_like(ncc_c), precise=False,
+    )
+
+    both_valid = valid_o & valid_c
+    n_valid = int(both_valid.sum())
+    print(f"[{model_name}] analytic-vs-oracle: N={n_points}, both_valid={n_valid}, "
+          f"valid_disagree={int((valid_o != valid_c).sum())}")
+    assert n_valid > n_points * 0.5, f"{model_name}: too few mutually valid points"
+
+    def _relerr_stats(name, g_ref, g_test, floor_frac=1e-3):
+        g_ref_v = g_ref[both_valid].reshape(-1)
+        g_test_v = g_test[both_valid].reshape(-1)
+        # Noise floor: a fraction of the RMS gradient magnitude (scale-aware,
+        # avoids hand-picked absolute constants across PH/EQ fixtures).
+        floor = floor_frac * g_ref_v.abs().square().mean().sqrt().item()
+        above = g_ref_v.abs() > floor
+        rel = (g_test_v[above] - g_ref_v[above]).abs() / g_ref_v[above].abs()
+        # a-posteriori bilinear-cell-straddle mask: isolated legit-branch
+        # disagreements (see docstring); must remain rare.
+        med = rel.median().item() if rel.numel() else float("nan")
+        straddle = rel > max(100.0 * med, 0.05)
+        n_straddle = int(straddle.sum())
+        rel_masked = rel[~straddle]
+        max_rel = rel_masked.max().item() if rel_masked.numel() else float("nan")
+        mean_rel = rel_masked.mean().item() if rel_masked.numel() else float("nan")
+        abs_diff_below = (g_test_v[~above] - g_ref_v[~above]).abs().max().item() if (~above).any() else 0.0
+        print(f"[{model_name}] {name}: n_above_floor={int(above.sum())}/{g_ref_v.numel()}, "
+              f"median_rel={med:.3e}, max_rel(masked)={max_rel:.3e}, mean_rel={mean_rel:.3e}, "
+              f"straddle_masked={n_straddle} ({n_straddle / max(int(above.sum()),1):.4f}), "
+              f"max|absdiff| below floor={abs_diff_below:.3e}")
+        assert n_straddle <= max(2, int(0.02 * int(above.sum()))), \
+            f"{model_name} {name}: too many outliers masked ({n_straddle}) -- not a rare-straddle pattern"
+        assert max_rel < 0.01, f"{model_name} {name}: max rel err {max_rel} >= 1%"
+        return max_rel
+
+    _relerr_stats("grad_depths", gd_o, gd_c)
+    _relerr_stats("grad_normals", gn_o, gn_c)
+    print(f"PASS [{model_name}] analytic CUDA backward (precise) matches oracle autograd (<1% rel err above noise floor)")
+
+    # Report-only fast-mode stats (see comment above the precise=False call).
+    for name, g_ref, g_test in (("grad_depths(fast)", gd_o, gd_f),
+                                ("grad_normals(fast)", gn_o, gn_f)):
+        g_ref_v = g_ref[both_valid].reshape(-1)
+        g_test_v = g_test[both_valid].reshape(-1)
+        floor = 1e-3 * g_ref_v.abs().square().mean().sqrt().item()
+        above = g_ref_v.abs() > floor
+        rel = (g_test_v[above] - g_ref_v[above]).abs() / g_ref_v[above].abs()
+        sign = (torch.sign(g_test_v[above]) == torch.sign(g_ref_v[above])).float().mean().item()
+        q50, q90, q99 = torch.quantile(rel, torch.tensor([0.5, 0.9, 0.99], device=rel.device)).tolist()
+        print(f"[{model_name}] {name} vs f64 oracle (report-only): "
+              f"p50={q50:.3e}, p90={q90:.3e}, p99={q99:.3e}, max={rel.max().item():.3e}, "
+              f"sign_agree={sign:.3f}")
+        assert sign > 0.95, f"{model_name} {name}: fast-mode sign agreement unexpectedly low ({sign})"
+
+
+def check_analytic_vs_fd_backward(model_name, render_model, n_points=256, patch_radius=3):
+    """Phase 2 validation (b): analytic backward vs the existing calibrated
+    (eps=3e-2) FD backward, both through the full EQWarpPatchNCC autograd
+    path (mode switch flipped for the analytic arm and restored after).
+    FD at eps=3e-2 is intentionally smoothed, so this is a directional/scale
+    agreement report (same convention as the Phase-1 FD-vs-oracle check),
+    not a tight tolerance."""
+    (ref_cam, neighbor_cam, image_r, image_n, pixels, depths0, normals0,
+     ray_dirs_r, R_rn, T_rn) = _backward_fixture(render_model, n_points, patch_radius, seed=11)
+
+    def _run(mode):
+        old = multiview_mod.MULTIVIEW_NCC_BACKWARD
+        multiview_mod.MULTIVIEW_NCC_BACKWARD = mode
+        try:
+            d = depths0.clone().requires_grad_(True)
+            n = normals0.clone().requires_grad_(True)
+            ncc, valid = eq_warp_patch_ncc(
+                d, n, pixels.int(), ray_dirs_r, R_rn, T_rn, image_r, image_n,
+                neighbor_cam.render_model, neighbor_cam.focal_x, neighbor_cam.focal_y,
+                neighbor_cam.principal_x, neighbor_cam.principal_y, patch_radius,
+            )
+            ncc.sum().backward()
+            return ncc.detach(), valid, d.grad.clone(), n.grad.clone()
+        finally:
+            multiview_mod.MULTIVIEW_NCC_BACKWARD = old
+
+    ncc_fd, valid_fd, gd_fd, gn_fd = _run("fd")
+    ncc_an, valid_an, gd_an, gn_an = _run("analytic")
+
+    # Forward path must be bit-identical regardless of backward mode.
+    assert torch.equal(ncc_fd, ncc_an) and torch.equal(valid_fd, valid_an), \
+        f"{model_name}: forward output changed with backward mode -- must be impossible"
+
+    bv = valid_fd
+    gd_sign = (torch.sign(gd_fd[bv]) == torch.sign(gd_an[bv])).float().mean().item()
+    gn_sign = (torch.sign(gn_fd[bv]) == torch.sign(gn_an[bv])).float().mean().item()
+    gd_diff = (gd_fd[bv] - gd_an[bv]).abs().mean().item()
+    gn_diff = (gn_fd[bv] - gn_an[bv]).abs().mean().item()
+    gd_scale = gd_an[bv].abs().mean().item()
+    gn_scale = gn_an[bv].abs().mean().item()
+    print(f"[{model_name}] analytic-vs-FD: n_valid={int(bv.sum())}, "
+          f"grad_depths sign_agree={gd_sign:.3f} mean|diff|={gd_diff:.3e} (analytic scale {gd_scale:.3e}); "
+          f"grad_normals sign_agree={gn_sign:.3f} mean|diff|={gn_diff:.3e} (analytic scale {gn_scale:.3e})")
+    # Same 0.65 bar the Phase-1 FD-vs-oracle check uses: FD is the noisy arm
+    # here; the analytic arm is separately held to <1% vs the oracle above.
+    assert gd_sign > 0.65, f"{model_name}: analytic-vs-FD grad_depths sign agreement too low ({gd_sign})"
+    assert gn_sign > 0.65, f"{model_name}: analytic-vs-FD grad_normals sign agreement too low ({gn_sign})"
+    print(f"PASS [{model_name}] analytic backward directionally consistent with calibrated FD backward")
+
+
+def benchmark_backward_modes(model_name, render_model, n_points=10000, patch_radius=3, iters=30):
+    """Phase 2 validation (c): microbenchmark forward+backward for the FD vs
+    analytic modes at ~10k query points (GPU-light: the synthetic images are
+    160x120 and all per-point buffers are O(n_points))."""
+    (ref_cam, neighbor_cam, image_r, image_n, pixels, depths0, normals0,
+     ray_dirs_r, R_rn, T_rn) = _backward_fixture(render_model, n_points, patch_radius, seed=3)
+
+    def _run_once():
+        d = depths0.clone().requires_grad_(True)
+        n = normals0.clone().requires_grad_(True)
+        ncc, valid = eq_warp_patch_ncc(
+            d, n, pixels.int(), ray_dirs_r, R_rn, T_rn, image_r, image_n,
+            neighbor_cam.render_model, neighbor_cam.focal_x, neighbor_cam.focal_y,
+            neighbor_cam.principal_x, neighbor_cam.principal_y, patch_radius,
+        )
+        ncc.sum().backward()
+
+    import time
+    results = {}
+    for label, mode, precise in (("fd", "fd", True),
+                                 ("analytic64", "analytic", True),
+                                 ("analytic32", "analytic", False)):
+        old_mode = multiview_mod.MULTIVIEW_NCC_BACKWARD
+        old_prec = multiview_mod.MULTIVIEW_NCC_ANALYTIC_PRECISE
+        multiview_mod.MULTIVIEW_NCC_BACKWARD = mode
+        multiview_mod.MULTIVIEW_NCC_ANALYTIC_PRECISE = precise
+        try:
+            for _ in range(3):  # warmup
+                _run_once()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                _run_once()
+            torch.cuda.synchronize()
+            results[label] = (time.perf_counter() - t0) / iters * 1e3
+        finally:
+            multiview_mod.MULTIVIEW_NCC_BACKWARD = old_mode
+            multiview_mod.MULTIVIEW_NCC_ANALYTIC_PRECISE = old_prec
+
+    print(f"[{model_name}] fwd+bwd timing @ {n_points} pts (avg of {iters}): "
+          f"fd={results['fd']:.3f} ms, analytic64={results['analytic64']:.3f} ms "
+          f"({results['fd']/results['analytic64']:.2f}x vs fd), "
+          f"analytic32={results['analytic32']:.3f} ms "
+          f"({results['fd']/results['analytic32']:.2f}x vs fd)")
+    return results
+
+
 def main():
     print("=== Step 2: pure-PyTorch oracle self-test (flat plane, NCC ~= 1) ===")
     check_flat_plane_ncc("PH", render_model=2)
@@ -317,6 +578,18 @@ def main():
     print("\n=== Step 4: finite-difference backward vs oracle autograd ===")
     check_backward_vs_oracle_autograd("PH", render_model=2)
     check_backward_vs_oracle_autograd("EQ", render_model=1)
+
+    print("\n=== Step 5 (Phase 2): analytic CUDA backward vs oracle autograd ===")
+    check_analytic_backward_vs_oracle("PH", render_model=2)
+    check_analytic_backward_vs_oracle("EQ", render_model=1)
+
+    print("\n=== Step 6 (Phase 2): analytic vs calibrated-FD backward (full autograd path) ===")
+    check_analytic_vs_fd_backward("PH", render_model=2)
+    check_analytic_vs_fd_backward("EQ", render_model=1)
+
+    print("\n=== Step 7 (Phase 2): fwd+backward timing, FD vs analytic ===")
+    benchmark_backward_modes("PH", render_model=2)
+    benchmark_backward_modes("EQ", render_model=1)
 
     print("\nAll Session F2 multiview checks PASSED.")
 
