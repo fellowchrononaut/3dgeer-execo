@@ -129,6 +129,18 @@ class OptimizationParams(ParamGroup):
         self.multiview_min_dis_relative = 0.002    # GW: multi_view_min_dis_relative
         self.multiview_max_dis_relative = 0.3      # GW: multi_view_max_dis_relative
         self.multiview_znear_relative = 0.02       # relative to scene radius (GW uses znear_relative similarly)
+        # Reference-side depth source for the multiview losses (the 2026-07-07/08
+        # depth-gradient saga, kept selectable for A/B isolation):
+        #   "median"   -- the rasterizer's natively differentiable median depth
+        #                 (Session G implicit backward + opacity relief valve;
+        #                 GW-faithful production default).
+        #   "st"       -- straight-through surrogate on a DETACHED median
+        #                 (fix2/fix3 method, exact value + crossing-gaussian
+        #                 position gradient only; no opacity path).
+        #   "invdepth" -- 1/expected_invdepth (fix1 method; NOT a surface
+        #                 depth, p50 19% off median -- kept only to reproduce
+        #                 that failure, do not use for real runs).
+        self.multiview_ref_depth = "median"
         # --- F2 completion: flatten loss, gaussian cap, GW feature LRs ---
         self.flatten_weight = 0.0            # GW gaussian_flattening_loss weight; 0.0 = OFF
         self.flatten_from_iter = 7000        # flatten loss active from this iter (when flatten_weight > 0)

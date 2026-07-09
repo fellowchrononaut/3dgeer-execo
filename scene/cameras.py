@@ -211,7 +211,8 @@ class Camera(nn.Module):
             self.distortion_coeffs = torch.from_numpy(distortion_coeffs.astype(np.float32)) * distortion_scaling
             self.mirror_shift = mirror_shift
             assert raymap is not None
-            self.raymap = torch.from_numpy(raymap.astype(np.float32)) #self.scannetpp_raymap(raymap, resolution, focal_x, focal_y, FoVx, FoVy, step)
+            raymap_f32 = raymap if raymap.dtype == np.float32 else raymap.astype(np.float32)
+            self.raymap = torch.from_numpy(raymap_f32) #self.scannetpp_raymap(raymap, resolution, focal_x, focal_y, FoVx, FoVy, step)
             self.image_width = self.raymap.shape[1]
             self.image_height = self.raymap.shape[0]
             # Override FoVx/FoVy using the actual ray extents of the raymap

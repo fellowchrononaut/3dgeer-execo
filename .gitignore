@@ -15,4 +15,5 @@ data/aria/scannetpp_formatted
 data/scnt/datasets
 data/tt/datasets
 data/*/datasets
+data/x5*
 ckpt*

@@ -26,7 +26,7 @@ import numpy as np
 import cv2
 from utils.ray_normals import depth_to_normals_via_rays, view_normals_to_world, world_to_view_normals, get_ray_dirs_view
 from gaussian_renderer import render_normal_field
-from utils.multiview import compute_nearest_cameras, geo_loss, eq_warp_patch_ncc, ref_to_neighbor_RT
+from utils.multiview import compute_nearest_cameras, geo_loss, eq_warp_patch_ncc, ref_to_neighbor_RT, straight_through_median_depth, expected_depth_from_invdepth
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -250,12 +250,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 neighbor_cam = scene.getTrainCameras()[neighbor_idx]
 
                 neighbor_render_pkg = render(neighbor_cam, gaussians, pipe, background)
-                # Session G: median_depth is natively differentiable (implicit
-                # backward with the opacity relief valve, like GW). No more
-                # straight-through surrogate.
-                ref_depth_valid = median_depth > 0
+                # Reference-side depth per --multiview_ref_depth (see
+                # arguments/__init__.py for the three methods' history):
+                # "median" = Session G natively differentiable median (implicit
+                # backward + opacity relief valve, GW-faithful default).
+                if opt.multiview_ref_depth == "median":
+                    ref_depth = median_depth
+                    ref_depth_valid = median_depth > 0
+                elif opt.multiview_ref_depth == "st":
+                    # detach() so the surrogate is the ONLY gradient path
+                    # (median is natively differentiable since Session G).
+                    ref_depth, ref_depth_valid = straight_through_median_depth(
+                        median_depth.detach(), render_pkg["gidx"],
+                        gaussians.get_xyz, viewpoint_cam.world_view_transform,
+                    )
+                elif opt.multiview_ref_depth == "invdepth":
+                    ref_depth, ref_depth_valid = expected_depth_from_invdepth(render_pkg["depth"])
+                else:
+                    raise ValueError(f"unknown multiview_ref_depth {opt.multiview_ref_depth!r}")
                 geo_loss_val, geo_mask, geo_weights = geo_loss(
-                    viewpoint_cam, neighbor_cam, median_depth, neighbor_render_pkg,
+                    viewpoint_cam, neighbor_cam, ref_depth, neighbor_render_pkg,
                     ref_depth_valid=ref_depth_valid,
                     pixel_noise_th=opt.multiview_pixel_noise_th,
                     znear_relative=opt.multiview_znear_relative,
@@ -272,7 +286,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     )
                     valid_idx = geo_mask.view(-1).nonzero(as_tuple=True)[0]
 
-                    depths_sel = median_depth.view(-1)[valid_idx]
+                    depths_sel = ref_depth.view(-1)[valid_idx]
                     normals_sel = normal_map_view.reshape(3, -1)[:, valid_idx].transpose(0, 1).contiguous()
                     pixels_sel = torch.stack(
                         [xs_mv.reshape(-1)[valid_idx], ys_mv.reshape(-1)[valid_idx]], dim=-1
