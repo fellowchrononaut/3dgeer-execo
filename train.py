@@ -122,7 +122,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 extra_params = {"sample_step": sample_step, "render_model_int": render_model_int, **cam_extra_params}
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer, width, height = network_gui.receive(extra_params)
                 if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
+                    if getattr(custom_cam, 'show_normals', False):
+                        net_image = (render_normal_field(custom_cam, gaussians, pipe) + 1.0) * 0.5
+                    else:
+                        net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
                     if sibr_mask_refcam is not None:
                         print("Applying SIBR mask to network image {}".format(sibr_mask_refcam))
                         net_mask = custom_cam.get_viewpoint_mask(sibr_mask_refcam)

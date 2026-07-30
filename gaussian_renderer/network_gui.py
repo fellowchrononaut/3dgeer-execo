@@ -72,6 +72,7 @@ def receive(extra_params):
     if width != 0 and height != 0:
         try:
             do_training = bool(message["train"])
+            show_normals = bool(message.get("show_normals", 0))
             fovy = message["fov_y"]
             fovx = message["fov_x"]
             znear = message["z_near"]
@@ -89,6 +90,7 @@ def receive(extra_params):
                                  render_model=render_model_int, focal_x=focal_x, focal_y=focal_y,
                                  principal_x=principal_x, principal_y=principal_y,
                                  distortion_coeffs=distortion_coeffs, raymap=raymap)
+            custom_cam.show_normals = show_normals
         except Exception as e:
             print("")
             traceback.print_exc()

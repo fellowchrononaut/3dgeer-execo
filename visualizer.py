@@ -16,7 +16,7 @@ import cv2
 import sys
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
-from gaussian_renderer import render, network_gui, GaussianModel
+from gaussian_renderer import render, render_normal_field, network_gui, GaussianModel
 from scene import Scene
 from utils.general_utils import safe_state
 from utils.image_utils import match_mask_to_image
@@ -100,14 +100,17 @@ def visualize(dataset, opt, pipe, iteration, sample_step, fov_mod, mask_path,
                      width, height) = network_gui.receive(extra_params)
 
                     if custom_cam is not None:
-                        net_image = render(
-                            custom_cam,
-                            gaussians,
-                            pipe,
-                            background,
-                            scaling_modifier,
-                            near_threshold=near_threshold,
-                        )["render"]
+                        if getattr(custom_cam, 'show_normals', False):
+                            net_image = (render_normal_field(custom_cam, gaussians, pipe) + 1.0) * 0.5
+                        else:
+                            net_image = render(
+                                custom_cam,
+                                gaussians,
+                                pipe,
+                                background,
+                                scaling_modifier,
+                                near_threshold=near_threshold,
+                            )["render"]
 
                         if sibr_mask_refcam is not None:
                             net_mask = custom_cam.get_viewpoint_mask(sibr_mask_refcam)
