@@ -1,0 +1,74 @@
+# 3DGEER image for the MODUS HPC (gpu01: H200 NVL sm_90, modus-visu: RTX 6000 Ada sm_89).
+#
+# Derived from Dockerfile_5090. Deltas, and only these:
+#   1. TORCH_CUDA_ARCH_LIST covers all three machines we run on:
+#        8.9  -> RTX 6000 Ada    (modus-visu01..03, SIBR viewing)
+#        9.0  -> H200 NVL        (gpu01, training)
+#        12.0 -> RTX 5090        (deos-simrobot-l, local dev)
+#      +PTX gives forward compatibility past Blackwell. PTX is forward-only,
+#      which is exactly why the 5090 image ("12.0+PTX") cannot run on sm_90.
+#   2. ninja, so in-place extension rebuilds on gpu01's 128 cores are fast.
+#   3. PYTHONNOUSERSITE=1: Apptainer bind-mounts $HOME, so ~/.local/lib/python3.11
+#      would otherwise shadow the container's site-packages.
+#
+# sibr_core is kept: modus-visu nodes have a 48 GB RTX 6000 Ada and a DCV
+# desktop, so SIBR runs on the cluster against checkpoints on GPFS.
+#
+# Build:  bash docker/build.sh h200      (on the dev PC, needs Docker Hub)
+# Deploy: see hpc/README.md              (push to ghcr.io, apptainer build on MODUS)
+
+FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel
+
+ENV TORCH_CUDA_ARCH_LIST="8.9;9.0;12.0+PTX"
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONNOUSERSITE=1
+
+# Update and install tzdata separately
+RUN apt update && apt install -y tzdata
+
+# Install necessary packages
+RUN apt install -y git && \
+    apt install -y libglew-dev libassimp-dev libboost-all-dev libgtk-3-dev libopencv-dev libglfw3-dev libavdevice-dev libavcodec-dev libeigen3-dev libxxf86vm-dev libembree-dev && \
+    apt clean && apt install wget && rm -rf /var/lib/apt/lists/*
+
+# Create a workspace directory
+WORKDIR /workspace/3dgs_dependency
+# Clone the repository (dev branch): https://github.com/graphdeco-inria/gaussian-splatting/issues/965
+RUN git clone -b master https://gitlab.inria.fr/sibr/sibr_core.git \
+    && git clone https://gitlab.inria.fr/bkerbl/simple-knn.git
+COPY submodules/geer-rasterizer /workspace/3dgs_dependency/geer-rasterizer
+
+WORKDIR /workspace/3dgs_dependency/sibr_core
+RUN git reset --hard d8856f6
+WORKDIR /workspace/3dgs_dependency/simple-knn
+RUN git reset --hard 44f7642
+# CUDA 12.8+ no longer transitively includes <float.h>; simple-knn references FLT_MAX without an explicit include.
+RUN sed -i '1i #include <cfloat>' simple_knn.cu
+
+# Create a Conda environment and activate it
+WORKDIR /workspace
+
+# RUN conda init bash && . ~/.bashrc && conda create -n geer python=3.8 && conda activate geer && \
+#     conda install -y pytorch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 pytorch-cuda=11.8 cudatoolkit=11.8 -c pytorch -c nvidia && \
+#     conda install tqdm && conda install plyfile -c defaults -c conda-forge && \
+#     pip install 3dgs_dependency/simple-knn && \
+#     pip install opencv-python psutil matplotlib
+
+RUN pip install --upgrade pip && \
+    pip install tqdm plyfile==1.1 opencv-python==4.10.0.84 psutil matplotlib numpy==1.26.4 ninja && \
+    pip install --no-build-isolation ./3dgs_dependency/simple-knn && \
+    pip install --no-build-isolation ./3dgs_dependency/geer-rasterizer
+
+# Tweak the CMake file for matching the existing OpenCV version. Fix the naming of FindEmbree.cmake
+WORKDIR /workspace/3dgs_dependency/sibr_core/cmake/linux
+RUN sed -i 's/find_package(OpenCV 4\.5 REQUIRED)/find_package(OpenCV 4.2 REQUIRED)/g' dependencies.cmake
+RUN sed -i 's/find_package(embree 3\.0 )/find_package(EMBREE)/g' dependencies.cmake
+RUN mv /workspace/3dgs_dependency/sibr_core/cmake/linux/Modules/FindEmbree.cmake /workspace/3dgs_dependency/sibr_core/cmake/linux/Modules/FindEMBREE.cmake
+
+# Fix the naming of the embree library in the rayscaster's cmake
+RUN sed -i 's/\bembree\b/embree3/g' /workspace/3dgs_dependency/sibr_core/src/core/raycaster/CMakeLists.txt
+
+# Ready to build the viewer now.
+WORKDIR /workspace/3dgs_dependency/sibr_core
+RUN cmake -Bbuild . -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 && \
+    cmake --build build -j24 --target install

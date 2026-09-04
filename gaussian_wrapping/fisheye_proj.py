@@ -14,20 +14,29 @@ The PH formula is the *exact* algebraic inverse of the ray formula used in
 =>  u = fx * (x / z) + W / 2 - 0.5
     v = fy * (y / z) + H / 2 - 0.5
 
-The EQ formula follows the same "-0.5" pixel-center convention for
-consistency, applied to the equidistant fisheye model
-theta = atan2(sqrt(x^2+y^2), z), phi = atan2(y, x):
+The KB/EQ formula applies the equidistant fisheye model
+theta = atan2(sqrt(x^2+y^2), z), phi = atan2(y, x), plus the same forward
+Kannala-Brandt radial polynomial used to build the per-pixel
+``camera.raymap`` at data-prep time (data/scnt/scnt_raymap.py::compute_error_map):
 
-    u = principal_x + focal_x * theta * cos(phi) - 0.5
-    v = principal_y + focal_y * theta * sin(phi) - 0.5
+    theta_d = theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8)
+    u = principal_x + focal_x * theta_d * cos(phi)
+    v = principal_y + focal_y * theta_d * sin(phi)
 
-Note this is the *undistorted* equidistant model (no Kannala-Brandt radial
-polynomial); the real per-pixel ``camera.raymap`` used by the CUDA
-rasterizer/get_ray_dirs_view may include KB distortion coefficients baked in
-at data-prep time (data/scnt/scnt_raymap.py). For X5 EQ data with
-distortion_scaling=0 (see 3DGEERGW_EXECUTION.md D6 / Session F notes) the two
-coincide; validation here is therefore a synthetic self-consistency check,
-not a round-trip against a real distorted raymap (see tests/test_fisheye_proj.py).
+using ``camera.distortion_coeffs`` (k1..k4). For X5 EQ data with
+distortion_scaling=0 (see 3DGEERGW_EXECUTION.md D6 / Session F notes)
+``distortion_coeffs`` is all zeros, so theta_d reduces to theta and this
+collapses back to the plain undistorted equidistant model -- the fix is a
+strict generalization, not a dataset-specific branch.
+
+Note this branch intentionally has *no* "-0.5" pixel-center shift, unlike
+the PH branch above. data/scnt/scnt_raymap.py builds the per-pixel raymap
+from raw integer pixel indices (``np.meshgrid(np.arange(W), np.arange(H))``,
+no +0.5), and get_ray_dirs_view's render_model==1 path reads that raymap
+directly with no offset either -- so this formula must match that same
+zero-offset convention to round-trip against the real, rendered rays (see
+tests/test_fisheye_proj.py check4, which caught a spurious ~0.71px bias
+before this was removed).
 """
 import math
 
@@ -71,12 +80,23 @@ def project_view_to_pixel(camera, x_view: torch.Tensor):
         )
         return u, v, valid
 
-    elif camera.render_model == 1:  # KB/EQ (equidistant fisheye, undistorted)
+    elif camera.render_model == 1:  # KB/EQ (equidistant fisheye)
         r = torch.sqrt(x * x + y * y)
         theta = torch.atan2(r, z)
         phi = torch.atan2(y, x)
-        u = camera.principal_x + camera.focal_x * theta * torch.cos(phi) - 0.5
-        v = camera.principal_y + camera.focal_y * theta * torch.sin(phi) - 0.5
+
+        dc = getattr(camera, "distortion_coeffs", None)
+        if dc is not None:
+            dc = dc.to(device=x_view.device, dtype=x_view.dtype)
+            k1, k2, k3, k4 = dc[0], dc[1], dc[2], dc[3]
+            theta2 = theta * theta
+            theta_d = theta * (1 + k1 * theta2 + k2 * theta2**2
+                                + k3 * theta2**3 + k4 * theta2**4)
+        else:
+            theta_d = theta
+
+        u = camera.principal_x + camera.focal_x * theta_d * torch.cos(phi)
+        v = camera.principal_y + camera.focal_y * theta_d * torch.sin(phi)
         valid = (
             (theta < _EQ_MAX_THETA)
             & (u >= -0.5) & (u <= W - 0.5)
