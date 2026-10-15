@@ -10,6 +10,14 @@
 # (e.g. continue a 7k run to 30k into a new model dir). Pass --iterations and
 # --checkpoint_iterations as usual; resume granularity = checkpoint spacing.
 # Success = train.py exits 0 and point_cloud/iteration_<--iterations> exists.
+#
+# KEEP_CKPTS=N keeps only the newest N checkpoints while training runs (see
+# tools/prune_checkpoints.sh), plus the iterations in KEEP_CKPT_ITERS
+# (e.g. "20000 30000"). Unset = keep every checkpoint (previous behaviour).
+#
+# Gives up early when two attempts in a row fail without writing a newer
+# checkpoint: the crash is then deterministic (e.g. an out-of-memory at a fixed
+# iteration) and further retries would only replay it.
 set -uo pipefail
 
 # The normal phase (from normal_from_iter) allocates differently sized buffers
@@ -30,6 +38,14 @@ TARGET="${TARGET:-30000}"
 
 mkdir -p "${MODEL_DIR}"
 LOG="${MODEL_DIR}/autoresume.log"
+PRUNE=(bash "$(dirname "$0")/prune_checkpoints.sh" "${MODEL_DIR}" "${KEEP_CKPTS:-}" ${KEEP_CKPT_ITERS:-})
+if [ -n "${KEEP_CKPTS:-}" ]; then
+    # Background pruner tied to this script's PID; train.py stays in the
+    # foreground (Ctrl-C and signals reach it as before). Final pass on exit.
+    "${PRUNE[@]}" --loop $$ &
+    trap '"${PRUNE[@]}"' EXIT
+fi
+NO_PROGRESS=0
 for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
     LATEST="$(ls "${MODEL_DIR}"/chkpnt*.pth 2>/dev/null | sort -V | tail -n 1)"
     START="${LATEST:-${INITIAL}}"
@@ -40,6 +56,16 @@ for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
     if [ "${rc}" -eq 0 ] && [ -d "${MODEL_DIR}/point_cloud/iteration_${TARGET}" ]; then
         echo "$(date '+%F %T') SUCCESS reached ${TARGET} after ${attempt} attempt(s)" | tee -a "${LOG}"
         exit 0
+    fi
+    NEWEST="$(ls "${MODEL_DIR}"/chkpnt*.pth 2>/dev/null | sort -V | tail -n 1)"
+    if [ -n "${LATEST}" ] && [ "${NEWEST}" = "${LATEST}" ]; then
+        NO_PROGRESS=$((NO_PROGRESS + 1))
+        if [ "${NO_PROGRESS}" -ge 2 ]; then
+            echo "$(date '+%F %T') GAVE UP: two attempts in a row crashed after $(basename "${LATEST}") without a newer checkpoint (deterministic failure)" | tee -a "${LOG}"
+            exit 1
+        fi
+    else
+        NO_PROGRESS=0
     fi
 done
 echo "$(date '+%F %T') GAVE UP after ${MAX_ATTEMPTS} attempts" | tee -a "${LOG}"

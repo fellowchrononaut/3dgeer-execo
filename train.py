@@ -205,6 +205,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = 0
 
         # --- GW surface-alignment losses ---
+        # --staged_backward: free the image render's graph before the normal
+        # renders (see arguments/__init__.py). Later losses then backpropagate
+        # on their own and enter `loss` detached, for logging only.
+        staged = (opt.staged_backward and opt.depth_normal_grad == "none"
+                  and not (opt.multiview and iteration >= opt.multiview_from_iter))
+        if staged:
+            loss.backward()
+            loss = loss.detach()
         median_depth = render_pkg["median_depth"]                # (1,H,W), differentiable (Session G)
         L_N = torch.zeros((), device="cuda"); L_DN = torch.zeros((), device="cuda")
         shape_map = None
@@ -242,12 +250,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             cos_DN = (shape_map * dn_target).sum(dim=0)
             if dn_valid.any():
                 L_DN = (1.0 - cos_DN[dn_valid]).mean()
+                if staged:
+                    (opt.depth_normal_weight * L_DN).backward()
+                    L_DN = L_DN.detach()
                 loss = loss + opt.depth_normal_weight * L_DN
         if normals_active:
             normal_map = render_normal_field(viewpoint_cam, gaussians, pipe)   # (3,H,W) world
             cos_N = (normal_map * target_n_world).sum(dim=0)
             if valid.any():
                 L_N = (1.0 - cos_N[valid]).mean()
+                if staged:
+                    (opt.normal_weight * L_N).backward()
+                    L_N = L_N.detach()
                 loss = loss + opt.normal_weight * L_N
             # online per-Gaussian error for wrapping densification
             with torch.no_grad():
@@ -389,7 +403,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             L_flatten = (gaussians.get_scaling.min(dim=-1).values / gaussians.spatial_lr_scale).mean()
             loss = loss + opt.flatten_weight * L_flatten
 
-        loss.backward()
+        if loss.requires_grad:  # with --staged_backward, parts are already backpropagated
+            loss.backward()
 
         iter_end.record()
 

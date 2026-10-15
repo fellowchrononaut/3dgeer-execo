@@ -159,6 +159,15 @@ class OptimizationParams(ParamGroup):
         #   "st"     -- straight-through surrogate (as multiview_ref_depth "st")
         # L_N keeps its detached target either way.
         self.depth_normal_grad = "none"
+        # Staged backward (memory): backpropagate the image loss before the
+        # normal fields are rendered, then L_DN and L_N one at a time, so the
+        # three renders' rasterizer buffers are never held together. Gradients
+        # accumulate to the same sum (only float summation order differs).
+        # From normal_from_iter the extra renders need ~4.5 GB each on x5 with
+        # ~4M Gaussians, which pushed a 32 GB 5090 into OOM at 20k. Applies
+        # only while depth_normal_grad is "none" and multiview is off (both
+        # make losses that reach back into the image render's graph).
+        self.staged_backward = False
         # --- F2 completion: flatten loss, gaussian cap, GW feature LRs ---
         self.flatten_weight = 0.0            # GW gaussian_flattening_loss weight; 0.0 = OFF
         self.flatten_from_iter = 7000        # flatten loss active from this iter (when flatten_weight > 0)
