@@ -7,6 +7,9 @@
 #   DATASET=x5_kb_1920 RENDER_MODEL=KB ... hpc/jobs/x5_eq.sh
 #     # same images/poses with the fitted lens distortion (data/x5_kb_1920/README.txt)
 #   START_CKPT=<path/chkpntN.pth> EXTRA_ARGS="--depth_normal_grad st" ...
+#   RAYMAP='raymap_fisheye_cam{cam_id}.npy' ...
+#     # one ray map per COLMAP camera (per lens); generate with
+#     # tools/fisheye_raymap.py --from_colmap <dataset>/colmap/cameras_fish.txt --out <dataset>/raymap_fisheye_cam{cam_id}.npy
 #     # continue another run's checkpoint into this RUN_NAME, with extra train.py flags
 #
 # Runs through tools/train_autoresume.sh: a crash (the stochastic rasterizer
@@ -51,7 +54,7 @@ bash tools/train_autoresume.sh "${OUTPUT_DIR}" "${MAX_ATTEMPTS:-6}" ${START_CKPT
     --render_model "${RENDER_MODEL}" \
     --dataset SCANNETPP \
     --camera_model FISHEYE \
-    --raymap_path "${DATASET_DIR}/raymap_fisheye.npy" \
+    --raymap_path "${DATASET_DIR}/${RAYMAP:-raymap_fisheye.npy}" \
     --mask_path "${DATASET_DIR}/mask_180.png" \
     --ip 127.0.0.1 --port "${VIEWER_PORT:-6009}" \
     ${EXTRA_ARGS:-}

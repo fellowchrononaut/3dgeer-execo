@@ -17,6 +17,7 @@ import sys
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
 from gaussian_renderer import render, render_normal_field, network_gui, GaussianModel
+from utils.raymap_utils import load_raymap
 from scene import Scene
 from utils.general_utils import safe_state
 from utils.image_utils import match_mask_to_image
@@ -36,12 +37,11 @@ def visualize(dataset, opt, pipe, iteration, sample_step, fov_mod, mask_path,
 
         dataset.fov_mod = fov_mod
         dataset.sample_step = sample_step
-        dataset.raymap = None
-        if raymap_path is not None and os.path.exists(raymap_path):
-            try:
-                dataset.raymap = np.load(raymap_path)
-            except (IOError, ValueError) as e:
-                print(f"Warning: could not load raymap from '{raymap_path}': {e}")
+        try:
+            dataset.raymap = load_raymap(raymap_path)   # shared file, or per-camera with {cam_id}
+        except (IOError, ValueError) as e:
+            dataset.raymap = None
+            print(f"Warning: could not load raymap from '{raymap_path}': {e}")
         dataset.render_model = render_model
         dataset.focal_scaling = focal_scaling
         dataset.distortion_scaling = distortion_scaling

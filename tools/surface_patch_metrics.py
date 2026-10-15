@@ -81,7 +81,9 @@ def main():
         mesh_v = (V, u, v, valid, xv.norm(dim=1))
 
     print(f"model {a.model_path} @ {a.iteration}  ({g.get_xyz.shape[0]} Gaussians, cam {a.cam_idx})")
-    print(f"{'patch':12s} {'attr':>6s} {'shape':>6s} {'depth':>6s}   {'mesh_rms':>9s}  (normal spreads in deg; mesh in scene units x1000)")
+    f_px = float(getattr(cam, "focal_x", 0.0) or 0.0) or (W / 2.0) / np.tan(cam.FoVx / 2.0)
+    print(f"{'patch':12s} {'attr':>6s} {'shape':>6s} {'depth':>6s}   {'mesh_rms':>9s} {'rms/dist':>9s} {'rms_px':>7s}  "
+          f"(normal spreads in deg; mesh_rms in scene units x1000; rms/dist in permille; rms_px = rms at that distance in pixels, f={f_px:.0f}px)")
     for spec in a.patch:
         name, rest = spec.split(":")
         cy, cx, S = (float(t) for t in rest.split(","))
@@ -96,7 +98,8 @@ def main():
             if len(P) >= 10:
                 c = P - P.mean(0)
                 res = c @ np.linalg.svd(c, full_matrices=False)[2][-1]
-                row += f"   {res.std() * 1000:9.2f}  (n={len(P)})"
+                rms, dist = res.std(), float(d0)
+                row += f"   {rms * 1000:9.2f} {rms / dist * 1000:9.2f} {rms / dist * f_px:7.2f}  (n={len(P)}, dist={dist:.2f})"
             else:
                 row += f"   {'n/a':>9s}  (n={len(P)})"
         print(row)

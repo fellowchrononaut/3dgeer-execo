@@ -27,6 +27,7 @@ from scene import Scene, GaussianModel
 from gaussian_renderer import render
 from gaussian_wrapping.fields import evaluate_occupancy_integrated
 from utils.ray_normals import get_ray_dirs_view
+from utils.raymap_utils import load_raymap
 
 
 def main():
@@ -47,7 +48,7 @@ def main():
     dataset.fov_mod = None; dataset.sample_step = 0.002
     dataset.focal_scaling = 1.0; dataset.distortion_scaling = 1.0
     dataset.mirror_shift = 0.0
-    dataset.raymap = np.load(args.raymap_path) if args.raymap_path else None
+    dataset.raymap = load_raymap(args.raymap_path)   # shared file, or per-camera with {cam_id}
 
     g = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, g, load_iteration=args.iteration, shuffle=False)

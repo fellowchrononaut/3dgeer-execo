@@ -27,6 +27,7 @@ from scene import Scene
 from scene.gaussian_model import GaussianModel
 
 from gaussian_wrapping.mesh_extraction import extract_mesh_pivot_mtet
+from utils.raymap_utils import load_raymap
 
 
 def build_scene(source_path, model_path, dataset_type, camera_model, iteration,
@@ -53,10 +54,7 @@ def build_scene(source_path, model_path, dataset_type, camera_model, iteration,
     dataset.focal_scaling = focal_scaling
     dataset.distortion_scaling = distortion_scaling
     dataset.mirror_shift = mirror_shift
-    dataset.raymap = None
-    if raymap_path is not None and os.path.exists(raymap_path):
-        import numpy as np
-        dataset.raymap = np.load(raymap_path)
+    dataset.raymap = load_raymap(raymap_path)   # shared file, or per-camera with {cam_id}
 
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)

@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+from utils.raymap_utils import load_raymap
 import time
 import torch
 from scene import Scene
@@ -137,9 +138,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         dataset.fov_mod = fov_mod
         dataset.sample_step = sample_step
 
-        dataset.raymap = None
-        if raymap_path is not None and os.path.exists(raymap_path):
-            dataset.raymap = np.load(raymap_path)
+        dataset.raymap = load_raymap(raymap_path)   # shared file, or per-camera with {cam_id}
         dataset.render_model = render_model
         dataset.focal_scaling = focal_scaling
         dataset.distortion_scaling = distortion_scaling

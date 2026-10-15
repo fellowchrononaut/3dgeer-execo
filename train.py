@@ -24,6 +24,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import numpy as np
 import cv2
+from utils.raymap_utils import load_raymap
 from utils.ray_normals import depth_to_normals_via_rays, depth_to_normals_via_rays_differentiable, view_normals_to_world, world_to_view_normals, get_ray_dirs_view
 from gaussian_renderer import render_normal_field
 from utils.multiview import compute_nearest_cameras, geo_loss, eq_warp_patch_ncc, ref_to_neighbor_RT, straight_through_median_depth, expected_depth_from_invdepth
@@ -46,9 +47,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     dataset.focal_scaling = focal_scaling
     dataset.distortion_scaling = distortion_scaling
     dataset.mirror_shift = mirror_shift
-    dataset.raymap = None
-    if raymap_path is not None and os.path.exists(raymap_path):
-        dataset.raymap = np.load(raymap_path)
+    dataset.raymap = load_raymap(raymap_path)   # shared file, or per-camera with {cam_id}
     scene = Scene(dataset, gaussians, shuffle=False)
 
     # --- GaussianWrapping multiview NCC+geo consistency (Session F2) ---

@@ -13,7 +13,12 @@ step is exact) but diverges near the image-circle edge for real coefficients
 Bisection over the monotonic part of the polynomial cannot overshoot. For
 k = 0 this reproduces scnt_raymap.py's output inside the monotonic range.
 
-usage: python tools/fisheye_raymap.py <scene_dir>
+usage:
+  python tools/fisheye_raymap.py <scene_dir>
+      one shared ray map from <scene_dir>/nerfstudio/transforms.json
+  python tools/fisheye_raymap.py --from_colmap <colmap>/cameras_fish.txt --out <dir>/raymap_fisheye_cam{cam_id}.npy
+      one ray map per OPENCV_FISHEYE camera in cameras_fish.txt (e.g. one per lens),
+      for --raymap_path <dir>/raymap_fisheye_cam{cam_id}.npy (see utils/raymap_utils.py)
 """
 import json
 import os
@@ -27,6 +32,30 @@ def main(scene_dir):
     W, H = int(info["w"]), int(info["h"])
     fx, fy, cx, cy = info["fl_x"], info["fl_y"], info["cx"], info["cy"]
     k = np.array([info.get(f"k{i}", 0.0) for i in range(1, 5)], dtype=np.float64)
+    out = os.path.join(scene_dir, "raymap_fisheye.npy")
+    write_raymap(out, W, H, fx, fy, cx, cy, k)
+
+
+def main_from_colmap(cameras_txt, out_pattern):
+    if "{cam_id}" not in out_pattern:
+        sys.exit("--out must contain {cam_id}")
+    n = 0
+    for line in open(cameras_txt):
+        if line.startswith("#") or not line.strip():
+            continue
+        t = line.split()
+        if t[1] != "OPENCV_FISHEYE":
+            sys.exit(f"camera {t[0]}: model {t[1]} is not OPENCV_FISHEYE")
+        cam_id, W, H = int(t[0]), int(t[2]), int(t[3])
+        fx, fy, cx, cy = map(float, t[4:8])
+        k = np.array(list(map(float, t[8:12])), dtype=np.float64)
+        print(f"camera {cam_id}: {W}x{H} f=({fx:.3f},{fy:.3f}) c=({cx:.3f},{cy:.3f})")
+        write_raymap(out_pattern.replace("{cam_id}", str(cam_id)), W, H, fx, fy, cx, cy, k)
+        n += 1
+    print(f"wrote {n} ray map(s)")
+
+
+def write_raymap(out, W, H, fx, fy, cx, cy, k):
 
     def theta_d(t):
         t2 = t * t
@@ -60,11 +89,16 @@ def main(scene_dir):
     rays = np.stack([x * s, y * s, np.cos(theta)], axis=-1)
     rays[delta <= 1e-6] = (0.0, 0.0, 1.0)
 
-    out = os.path.join(scene_dir, "raymap_fisheye.npy")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     np.save(out, rays.astype(np.float32))
     print(f"k={k.tolist()}  invertible to {np.degrees(t_max):.1f} deg (radius {d_max * fx:.0f} px)")
     print(f"saved {out}  {rays.shape}")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    if len(sys.argv) == 5 and sys.argv[1] == "--from_colmap" and sys.argv[3] == "--out":
+        main_from_colmap(sys.argv[2], sys.argv[4])
+    elif len(sys.argv) == 2:
+        main(sys.argv[1])
+    else:
+        sys.exit(__doc__)

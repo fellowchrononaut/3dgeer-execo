@@ -10,6 +10,7 @@
 #
 
 from scene.cameras import Camera
+from utils.raymap_utils import raymap_for_camera
 import numpy as np
 from utils.graphics_utils import fov2focal
 from PIL import Image
@@ -75,7 +76,7 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                   train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,
                   render_model=args.render_model, 
                   focal_scaling=args.focal_scaling, distortion_scaling=args.distortion_scaling, mirror_shift=args.mirror_shift,
-                  raymap=args.raymap,
+                  raymap=raymap_for_camera(args.raymap, getattr(cam_info, "camera_id", 0)),
                   intr_width=cam_info.width, intr_height=cam_info.height)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):

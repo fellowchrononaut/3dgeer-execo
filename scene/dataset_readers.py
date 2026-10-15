@@ -60,6 +60,7 @@ class CameraInfo_fisheye(NamedTuple):
     depth_params: dict = {}
     depth_path: str = ""
     is_test: bool = False
+    camera_id: int = 0          # COLMAP camera (intrinsics) id; selects the per-camera ray map
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -332,7 +333,8 @@ def readColmapCameras_fisheye(cam_extrinsics, cam_intrinsics, images_folder, fov
                                       principal_x=principal_x, principal_y=principal_y,
                                       distortion_coeffs=distortion_coeffs,
                                       image=image,
-                                      image_path=image_path, image_name=image_name, width=width, height=height)
+                                      image_path=image_path, image_name=image_name, width=width, height=height,
+                                      camera_id=extr.camera_id)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
