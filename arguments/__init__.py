@@ -51,6 +51,10 @@ class ModelParams(ParamGroup):
         self._model_path = "./output/"
         self._images = "images"
         self._depths = ""
+        # Per-image loss masks: folder (relative to source_path) of
+        # <image_name>.png, white = pixel used by the loss. "" = none.
+        # Replaces train.py --mask_path (one mask for every image).
+        self.masks = ""
         self._resolution = -1
         self._camera_model = "FISHEYE" #FISHEYE/PINHOLE
         self.dataset = "AUTO" #AUTO/COLMAP/BLENDER/SCANNETPP

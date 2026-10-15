@@ -17,6 +17,7 @@ from PIL import Image
 import cv2
 import psutil
 import torch
+import os
 
 WARNED = False
 
@@ -41,6 +42,13 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
             raise
     else:
         invdepthmap = None
+
+    loss_mask = None
+    if getattr(args, "masks", ""):
+        mask_path = os.path.join(args.source_path, args.masks, cam_info.image_name + ".png")
+        if not os.path.exists(mask_path):
+            raise FileNotFoundError(f"no loss mask for {cam_info.image_name}: {mask_path}")
+        loss_mask = Image.open(mask_path).convert("L")
         
     orig_w, orig_h = image.size
     if args.resolution in [1, 2, 4, 8]:
@@ -71,7 +79,7 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, focal_x=cam_info.focal_x, focal_y=cam_info.focal_y,
                   principal_x=cam_info.principal_x, principal_y=cam_info.principal_y, distortion_coeffs=distortion_coeffs,
                   depth_params=cam_info.depth_params,
-                  image=image, invdepthmap=invdepthmap,
+                  image=image, invdepthmap=invdepthmap, loss_mask=loss_mask,
                   image_name=cam_info.image_name, uid=id, step=args.sample_step, data_device=args.data_device,
                   train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,
                   render_model=args.render_model, 

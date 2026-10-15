@@ -109,6 +109,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         valid_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         valid_mask = np.repeat(valid_mask[None, ...], 3, axis=0)
         valid_mask = torch.tensor(valid_mask)
+    # Per-image loss masks (--masks, see arguments/__init__.py): masked L1/SSIM
+    # normalised over the used pixels, masked test metrics, and masked-out
+    # reference pixels excluded from the multiview losses.
+    use_image_masks = bool(getattr(dataset, "masks", ""))
+    if use_image_masks and valid_mask is not None:
+        raise SystemExit("--masks (per image) and --mask_path (global) are exclusive; bake the global mask into the per-image masks")
+    print("masks:", os.path.join(dataset.source_path, dataset.masks) if use_image_masks else None)
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -167,8 +174,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             image[match_mask_to_image(valid_mask, image) == 0] = 0.0
         # Loss
         gt_image = viewpoint_cam.sampled_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        ssim_value = ssim(image, gt_image)
+        if use_image_masks:
+            loss_mask = viewpoint_cam.alpha_mask.cuda().expand_as(image)
+            image, gt_image = image * loss_mask, gt_image * loss_mask
+            Ll1 = (image - gt_image).abs().sum() / loss_mask.sum().clamp_min(1.0)
+            ssim_value = ssim(image, gt_image, mask=loss_mask)
+        else:
+            Ll1 = l1_loss(image, gt_image)
+            ssim_value = ssim(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         if iteration % 500 == 0:
@@ -285,6 +298,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     ref_depth, ref_depth_valid = expected_depth_from_invdepth(render_pkg["depth"])
                 else:
                     raise ValueError(f"unknown multiview_ref_depth {opt.multiview_ref_depth!r}")
+                if use_image_masks:
+                    # Only the reference side: the NCC kernel does not report where
+                    # it samples the neighbour, so masked neighbour pixels (e.g. the
+                    # photographer) are left to the ncc_term < 0.9 rejection.
+                    ref_depth_valid = ref_depth_valid & (viewpoint_cam.alpha_mask.cuda() > 0.5).reshape(ref_depth_valid.shape)
                 geo_loss_val, geo_mask, geo_weights = geo_loss(
                     viewpoint_cam, neighbor_cam, ref_depth, neighbor_render_pkg,
                     ref_depth_valid=ref_depth_valid,
@@ -416,7 +434,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_writer.add_scalar('train_loss/L_MV', L_MV.item(), iteration)
             if tb_writer and flatten_active:
                 tb_writer.add_scalar('train_loss/L_flatten', L_flatten.item(), iteration)
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), dataset.train_test_exp, valid_mask)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), dataset.train_test_exp, valid_mask, use_image_masks)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -481,7 +499,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, valid_mask):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, valid_mask, use_image_masks=False):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -502,15 +520,26 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     if valid_mask is not None:
                         image[match_mask_to_image(valid_mask, image) == 0] = 0.0
                     gt_image = torch.clamp(viewpoint.sampled_image.to("cuda"), 0.0, 1.0)
+                    metric_mask = None
+                    if use_image_masks:
+                        metric_mask = viewpoint.alpha_mask.to("cuda").expand_as(image)
+                        image, gt_image = image * metric_mask, gt_image * metric_mask
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
+                        if metric_mask is not None:
+                            metric_mask = metric_mask[..., metric_mask.shape[-1] // 2:]
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                    if metric_mask is not None:
+                        # over the used pixels only (not comparable with unmasked runs)
+                        l1_test += ((image - gt_image).abs().sum() / metric_mask.sum().clamp_min(1.0)).double()
+                        psnr_test += psnr(image, gt_image, mask=metric_mask).mean().double()
+                    else:
+                        l1_test += l1_loss(image, gt_image).mean().double()
+                        psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))

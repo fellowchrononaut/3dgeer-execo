@@ -103,7 +103,8 @@ class Camera(nn.Module):
                  train_test_exp = False, is_test_dataset = False, is_test_view = False,
                  render_model = "BEAP", focal_scaling = 1.0, distortion_scaling = 1.0, mirror_shift = 0.0,
                  raymap = None,
-                 intr_width = None, intr_height = None
+                 intr_width = None, intr_height = None,
+                 loss_mask = None
                  ):
         super(Camera, self).__init__()
 
@@ -130,6 +131,12 @@ class Camera(nn.Module):
             self.alpha_mask = resized_image_rgb[3:4, ...].to(self.data_device)
         else: 
             self.alpha_mask = torch.ones_like(resized_image_rgb[0:1, ...].to(self.data_device))
+
+        # Per-image loss mask (--masks): folded into alpha_mask, which
+        # train.py uses as the loss/metric mask when --masks is set.
+        self.has_loss_mask = loss_mask is not None
+        if loss_mask is not None:
+            self.alpha_mask = self.alpha_mask * (PILtoTorch(loss_mask, resolution) > 0.5).float().to(self.data_device)
 
         if train_test_exp and is_test_view:
             if is_test_dataset:
