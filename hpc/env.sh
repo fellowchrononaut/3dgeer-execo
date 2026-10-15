@@ -14,11 +14,10 @@ OUTPUT="${OUTPUT:-${SCRATCH}/output}"
 LOGS="${LOGS:-${SCRATCH}/logs}"
 
 # The SIF lives in $HOME (45 GB quota, barely used) so it doesn't eat the
-# 95 GB scratch quota that datasets and checkpoints have to share.
+# scratch quota that datasets and checkpoints have to share.
 SIF="${SIF:-${HOME}/containers/geer_h200.sif}"
 
 APPTAINER_MODULE="${APPTAINER_MODULE:-apptainer/1.4.5-3}"
-GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/fellowchrononaut/3dgeer:h200}"
 
 # PYTHONPATH makes the in-place-built extensions in the bind-mounted repo win
 # over the copies baked into the read-only SIF. PYTHONPATH precedes
@@ -37,6 +36,7 @@ geer_exec() {
     apptainer exec --nv \
         --bind "${SCRATCH}:${SCRATCH}" \
         --env PYTHONNOUSERSITE=1 \
+        --env PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
         --env PYTHONPATH="${GEER_PYTHONPATH}" \
         --pwd "${REPO}" \
         "${SIF}" "$@"

@@ -7,8 +7,8 @@
 #
 # Extensions are built --inplace into the bind-mounted repo rather than pip
 # installed, because a SIF's site-packages is read-only. hpc/env.sh puts these
-# directories on PYTHONPATH so the fresh sm_90 build shadows the sm_89/sm_90/
-# sm_120 fat binary baked into the image.
+# directories on PYTHONPATH so the fresh build shadows the sm_89/sm_90 copy
+# baked into the image.
 #
 # The compiled .so is architecture-specific and MUST NOT travel between
 # machines. hpc/sync.sh excludes '*.so' and 'build/' for exactly this reason:

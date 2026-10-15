@@ -50,9 +50,15 @@ echo "===== GPU ====="
 nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv
 
 echo "===== PROVENANCE ====="
-GIT_SHA="$(git -C "${REPO}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-GIT_DIRTY="$(git -C "${REPO}" status --porcelain 2>/dev/null | wc -l)"
-echo "git        ${GIT_SHA} (${GIT_DIRTY} uncommitted files)"
+# The repo usually arrives by rsync (hpc/sync.sh code), which does not copy
+# .git; sync.sh records the dev PC's commit in .sync_provenance instead.
+if [ -d "${REPO}/.git" ]; then
+    echo "git        $(git -C "${REPO}" rev-parse --short HEAD) ($(git -C "${REPO}" status --porcelain | wc -l) uncommitted files)"
+elif [ -f "${REPO}/.sync_provenance" ]; then
+    sed 's/^/synced     /' "${REPO}/.sync_provenance"
+else
+    echo "code       unknown provenance (no .git, no .sync_provenance)"
+fi
 echo "sif mtime  $(stat -c %y "${SIF}" 2>/dev/null || echo missing)"
 echo "job script ${JOB_SCRIPT}"
 

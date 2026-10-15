@@ -17,3 +17,7 @@ data/tt/datasets
 data/*/datasets
 data/x5*
 ckpt*
+# Compiled CUDA extensions: architecture-specific build products.
+# An sm_120 .so built on the 5090 imports fine on the H200 and then fails at
+# kernel launch ("no kernel image is available"). Each machine builds its own.
+*.so
