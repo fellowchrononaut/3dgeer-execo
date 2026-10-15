@@ -1,0 +1,96 @@
+# Digital_Twin: dataset preparation for GUTWrap (video -> training dataset).
+# Training, viewing and mesh extraction stay in the geer image (Dockerfile_5090);
+# this image holds the preparation tools, so they can move independently:
+#   ffmpeg/exiftool  INSV demux, frame extraction
+#   SAM2.1           photographer / object masks (video propagation)
+#   pycolmap 3.10    per-lens bundle adjustment (tools/colmap_ba_fisheye.py; same
+#                    version as the geer image, whose API quirks the tool handles)
+#   COLMAP 4.2.1     CLI + GUI, CUDA SIFT/matching and GPU bundle adjustment
+#                    (Ceres master with CUDA + cuDSS), rigs, global mapper
+# SAM3 (gated weights) is added later; Python 3.12 and torch >= 2.7 are what it needs.
+#
+# Build and run: docker/build_digital_twin.sh, docker/run_digital_twin.sh
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+# RTX 5090 (sm_120); +PTX keeps the SAM2 extension loadable on other GPUs.
+ENV TORCH_CUDA_ARCH_LIST="12.0+PTX"
+
+RUN apt update && apt install -y tzdata && \
+    apt install -y python3.12 python3.12-venv python3.12-dev git wget \
+        ffmpeg libimage-exiftool-perl libgl1 libglib2.0-0 && \
+    apt clean && rm -rf /var/lib/apt/lists/*
+
+# One venv for every tool (Ubuntu 24.04's system Python is externally managed).
+RUN python3.12 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+
+RUN pip install --upgrade pip && \
+    pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128 && \
+    pip install numpy==1.26.4 opencv-python-headless==4.10.0.84 pillow scipy tqdm plyfile==1.1 matplotlib \
+        pycolmap==3.10.0 huggingface_hub
+
+# SAM2 at a pinned commit, with its CUDA extension (mask post-processing) built for sm_120.
+WORKDIR /workspace
+RUN git clone https://github.com/facebookresearch/sam2.git && \
+    cd sam2 && git reset --hard 2b90b9f5ceec907a1c18123530e92e794ad901a4 && \
+    SAM2_BUILD_CUDA=1 SAM2_BUILD_ALLOW_ERRORS=0 pip install --no-build-isolation -e .
+
+# Public SAM2.1 checkpoint, baked in so the image works offline (MODUS compute nodes).
+RUN mkdir -p /workspace/checkpoints && \
+    wget -q -O /workspace/checkpoints/sam2.1_hiera_large.pt \
+        https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
+ENV SAM2_CHECKPOINT=/workspace/checkpoints/sam2.1_hiera_large.pt
+ENV SAM2_CONFIG=configs/sam2.1/sam2.1_hiera_l.yaml
+
+# --- COLMAP 4.2.1 with GPU bundle adjustment ---------------------------------
+# Dependencies as in COLMAP's own docker/Dockerfile (4.2.1), plus cuDSS and
+# Ceres' own build dependencies, with OpenBLAS instead of MKL.
+RUN apt update && \
+    apt install -y cmake ninja-build build-essential \
+        libboost-program-options-dev libboost-graph-dev libboost-system-dev \
+        libeigen3-dev libopenimageio-dev openimageio-tools libmetis-dev \
+        libgoogle-glog-dev libgflags-dev libgtest-dev libgmock-dev libsqlite3-dev libglew-dev \
+        qt6-base-dev libqt6opengl6-dev libqt6openglwidgets6 qt6-svg-dev \
+        libcgal-dev libcurl4-openssl-dev libssl-dev libsuitesparse-dev libopenblas-dev \
+        libcudss0-dev-cuda-12 libcudss0-static-cuda-12 && \
+    apt clean && rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /usr/include/opencv4 && \
+    ln -s /usr/include/libcudss/12 /usr/lib/x86_64-linux-gnu/libcudss/include
+# ^ the cuDSS deb's cudss-config.cmake looks for cudss.h only relative to itself
+#   (first candidate .../libcudss/include), not in /usr/include/libcudss/12
+#   where the deb installs it; its static-targets file needs the -static deb.
+# GPU sparse BA needs Ceres >= 2.3 built with CUDA and cuDSS
+# (colmap src/colmap/estimators/bundle_adjustment_ceres.cc). No Ceres release
+# has that yet (Ubuntu's 2.2.0 is CPU-only), so build a pinned master commit
+# and fail the build if cuDSS was not picked up. Ceres master needs Abseil
+# >= 20240116 (Ubuntu 24.04 has 20220623), so the bundled submodule is used;
+# SuiteSparse is off by default on master but is COLMAP's CPU sparse fallback.
+RUN git clone https://github.com/ceres-solver/ceres-solver.git /workspace/ceres-solver && \
+    cd /workspace/ceres-solver && git reset --hard dd4199f718d27cf92eaf259ce52dca0abd0b9626 && \
+    git submodule update --init third_party/abseil-cpp && \
+    cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARKS=OFF \
+        -DWITH_CUDA=default -DWITH_SUITESPARSE=ON -DCMAKE_CUDA_ARCHITECTURES=120 \
+        -Dcudss_DIR=/usr/lib/x86_64-linux-gnu/libcudss/12/cmake/cudss && \
+    ninja -C build install && rm -rf build && \
+    ! grep -q "^#define CERES_NO_CUDSS" /usr/local/include/ceres/internal/config.h && \
+    ! grep -q "^#define CERES_NO_CUDA$" /usr/local/include/ceres/internal/config.h
+RUN git clone -b 4.2.1 --depth 1 https://github.com/colmap/colmap.git /workspace/colmap && \
+    cd /workspace/colmap && \
+    cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release \
+        -DCUDA_ENABLED=ON -DCMAKE_CUDA_ARCHITECTURES=120 \
+        -Dcudss_DIR=/usr/lib/x86_64-linux-gnu/libcudss/12/cmake/cudss && \
+    ninja -C build install && rm -rf build
+ENV QT_XCB_GL_INTEGRATION=xcb_egl
+# The cuDSS deb puts libcudss.so.0 in a versioned directory the loader does not search.
+RUN echo /usr/lib/x86_64-linux-gnu/libcudss/12 > /etc/ld.so.conf.d/cudss.conf && ldconfig && \
+    colmap -h > /dev/null
+
+# The container runs as the host user (no root-owned files in data/), so HOME
+# must be writable for any uid. HF_HOME is mounted from the host (SAM3 token).
+RUN mkdir -p /workspace/home && chmod 1777 /workspace/home
+ENV HOME=/workspace/home
+ENV HF_HOME=/workspace/hf
+
+WORKDIR /home
