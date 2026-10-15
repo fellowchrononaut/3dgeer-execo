@@ -18,6 +18,8 @@ import os
 import sys
 from argparse import ArgumentParser
 
+import torch
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from arguments import ModelParams, PipelineParams, OptimizationParams
@@ -124,6 +126,12 @@ def main():
                               "number or a negative value's absence (i.e. omit) to disable "
                               "-- pass e.g. 1e9 to effectively disable.")
 
+    parser.add_argument("--max_gaussian_extent", type=float, default=1.0,
+                        help="Drop Gaussians whose largest axis exceeds this multiple of "
+                             "scene.cameras_extent before extraction (degenerate blow-ups "
+                             "from training fault the CUDA field evaluation). Pass a large "
+                             "value, e.g. 1e9, to disable.")
+
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
@@ -143,6 +151,35 @@ def main():
     )
     print(f"[extract_mesh] loaded {gaussians.get_xyz.shape[0]} Gaussians from "
           f"{args.model_path} @ iteration {args.iteration}")
+
+    # Drop degenerate Gaussians before they reach the CUDA field evaluation.
+    # On x5_kb_gw_30k the normal/wrap phase (20k-30k) left a small number
+    # unstable: all-NaN rows (0 @20k, 231 @26k, 789 @30k of ~2.5M) and opaque
+    # Gaussians blown up to scene size (log-scale > 2: 0 @20k, 1729 @30k, max
+    # 5.67). The rasterizer's frustum test skips NaN rows during training, so
+    # PSNR is unaffected, but here either kind faults _forward_buffers_for_view
+    # with an illegal memory access. Neither is a real surface.
+    with torch.no_grad():
+        P = gaussians._xyz.shape[0]
+        attrs = [a for a in ("_xyz", "_features_dc", "_features_rest", "_scaling",
+                             "_rotation", "_opacity", "_normals")
+                 if getattr(gaussians, a, None) is not None
+                 and getattr(gaussians, a).numel() > 0 and getattr(gaussians, a).shape[0] == P]
+        keep = torch.ones(P, dtype=torch.bool, device=gaussians._xyz.device)
+        for a in attrs:
+            keep &= torch.isfinite(getattr(gaussians, a).reshape(P, -1)).all(dim=1)
+        n_nonfinite = int((~keep).sum())
+        extent = float(scene.cameras_extent)
+        max_axis = torch.nan_to_num(gaussians.get_scaling.max(dim=1).values, nan=float("inf"))
+        oversized = keep & (max_axis > args.max_gaussian_extent * extent)
+        n_oversized = int(oversized.sum())
+        keep &= ~oversized
+        if n_nonfinite or n_oversized:
+            for a in attrs:
+                setattr(gaussians, a, torch.nn.Parameter(getattr(gaussians, a)[keep]))
+            print(f"[extract_mesh] dropped {n_nonfinite} non-finite and {n_oversized} oversized "
+                  f"(largest axis > {args.max_gaussian_extent} x cameras_extent {extent:.3f}) "
+                  f"Gaussians; {gaussians._xyz.shape[0]} remain")
 
     cameras = scene.getTrainCameras()
     # per-mesh stats file (Session E wrote a shared stats.txt; that clobbered

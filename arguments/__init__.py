@@ -141,6 +141,20 @@ class OptimizationParams(ParamGroup):
         #                 depth, p50 19% off median -- kept only to reproduce
         #                 that failure, do not use for real runs).
         self.multiview_ref_depth = "median"
+        # Depth gradient for L_DN (2026-10-15). L_DN's depth->normal target was
+        # computed under no_grad because median depth was forward-only when it
+        # was written; Session G made it differentiable but the no_grad stayed.
+        # Result: L_DN only ROTATES Gaussians toward the (noisy) depth normals
+        # and never moves depth/positions toward the normals -- on x5_kb the
+        # Gaussians end well oriented but stacked at different depths
+        # ("shingled"; depth-normal spread ~50 deg on flat patches vs ~7 deg
+        # for shape normals), which is the jagged mesh. GW's L_DN is two-way
+        # (gaussian_wrapping/train.py:321-338, depth NOT detached).
+        #   "none"   -- previous behavior (target detached), the default
+        #   "median" -- Session G natively differentiable median depth
+        #   "st"     -- straight-through surrogate (as multiview_ref_depth "st")
+        # L_N keeps its detached target either way.
+        self.depth_normal_grad = "none"
         # --- F2 completion: flatten loss, gaussian cap, GW feature LRs ---
         self.flatten_weight = 0.0            # GW gaussian_flattening_loss weight; 0.0 = OFF
         self.flatten_from_iter = 7000        # flatten loss active from this iter (when flatten_weight > 0)

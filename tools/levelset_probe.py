@@ -39,12 +39,15 @@ def main():
     parser.add_argument("--cx", type=float, default=0.5, help="patch center x (fraction of W)")
     parser.add_argument("--S", type=int, default=40, help="patch side length in pixels")
     parser.add_argument("--band", type=float, default=0.10, help="bisection band as fraction of mean depth")
+    parser.add_argument("--raymap_path", type=str, default=None,
+                        help="per-pixel ray map, required for --render_model KB/EQ (fisheye)")
     args = parser.parse_args()
     dataset = lp.extract(args); opt = op.extract(args); pipe = pp.extract(args)
     dataset.render_model = args.render_model
     dataset.fov_mod = None; dataset.sample_step = 0.002
     dataset.focal_scaling = 1.0; dataset.distortion_scaling = 1.0
-    dataset.mirror_shift = 0.0; dataset.raymap = None
+    dataset.mirror_shift = 0.0
+    dataset.raymap = np.load(args.raymap_path) if args.raymap_path else None
 
     g = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, g, load_iteration=args.iteration, shuffle=False)

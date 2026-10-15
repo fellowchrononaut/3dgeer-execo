@@ -24,7 +24,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import numpy as np
 import cv2
-from utils.ray_normals import depth_to_normals_via_rays, view_normals_to_world, world_to_view_normals, get_ray_dirs_view
+from utils.ray_normals import depth_to_normals_via_rays, depth_to_normals_via_rays_differentiable, view_normals_to_world, world_to_view_normals, get_ray_dirs_view
 from gaussian_renderer import render_normal_field
 from utils.multiview import compute_nearest_cameras, geo_loss, eq_warp_patch_ncc, ref_to_neighbor_RT, straight_through_median_depth, expected_depth_from_invdepth
 try:
@@ -212,9 +212,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 target_n_world = view_normals_to_world(viewpoint_cam, target_n_view)
         if dn_active:
             shape_map = render_normal_field(viewpoint_cam, gaussians, pipe, shape=True)
-            cos_DN = (shape_map * target_n_world).sum(dim=0)
-            if valid.any():
-                L_DN = (1.0 - cos_DN[valid]).mean()
+            dn_target, dn_valid = target_n_world, valid
+            if opt.depth_normal_grad != "none":
+                # Two-way L_DN (GW): let the loss also move depth toward the
+                # normals, not only the normals toward the depth.
+                if opt.depth_normal_grad == "median":
+                    dn_depth = median_depth
+                elif opt.depth_normal_grad == "st":
+                    dn_depth, _ = straight_through_median_depth(
+                        median_depth.detach(), render_pkg["gidx"],
+                        gaussians.get_xyz, viewpoint_cam.world_view_transform,
+                    )
+                else:
+                    raise ValueError(f"unknown depth_normal_grad {opt.depth_normal_grad!r}")
+                dn_n_view, dn_valid = depth_to_normals_via_rays_differentiable(viewpoint_cam, dn_depth)
+                dn_target = view_normals_to_world(viewpoint_cam, dn_n_view)
+            cos_DN = (shape_map * dn_target).sum(dim=0)
+            if dn_valid.any():
+                L_DN = (1.0 - cos_DN[dn_valid]).mean()
                 loss = loss + opt.depth_normal_weight * L_DN
         if normals_active:
             normal_map = render_normal_field(viewpoint_cam, gaussians, pipe)   # (3,H,W) world

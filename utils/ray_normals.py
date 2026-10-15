@@ -30,7 +30,17 @@ def get_ray_dirs_view(camera):
 @torch.no_grad()
 def depth_to_normals_via_rays(camera, dist_map):
     """dist_map (1,H,W) Euclidean distance along the ray (median depth).
-    Returns view-space unit normals (3,H,W) + validity mask (H,W)."""
+    Returns view-space unit normals (3,H,W) + validity mask (H,W).
+    Always detached (no_grad); see depth_to_normals_via_rays_differentiable."""
+    return depth_to_normals_via_rays_differentiable(camera, dist_map)
+
+
+def depth_to_normals_via_rays_differentiable(camera, dist_map):
+    """Same as depth_to_normals_via_rays, but keeps the autograd graph so a
+    loss on the returned normals moves the depth (and through it the
+    Gaussians), as GW's geometry_utils.depth_to_normal does. Used by the
+    two-way L_DN (--depth_normal_grad); the decorated variant above blocked
+    that gradient even after median depth became differentiable."""
     dirs = get_ray_dirs_view(camera)                     # (3,H,W)
     pts = dirs * dist_map                                # (3,H,W)
     dx = pts[:, :, 1:] - pts[:, :, :-1]
