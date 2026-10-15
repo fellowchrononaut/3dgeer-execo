@@ -937,9 +937,21 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	uint2 rect_min, rect_max;
 	getRect2(screen_grid_aligned_pbf, rect_min, rect_max, grid);
-	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
+	// Signed spans. rect corners are uint2, so an inverted PBF (max < min, e.g.
+	// a Gaussian whose 3-sigma extent crosses the camera plane, which flips its
+	// fisheye tangent-space bounds) used to make both differences wrap: the
+	// product passed the zero-area test and was RESERVED as tiles_touched, while
+	// my_radius = max of two wrapped values went negative, so duplicateWithKeys
+	// skipped the Gaussian and left its reserved key slots unwritten. Garbage in
+	// those slots -> garbage tile ids -> identifyTileRanges wrote ranges[] out
+	// of bounds: the stochastic "illegal memory access" (2026-10-15). One axis
+	// inverted made the product huge instead. Such Gaussians were already never
+	// rasterized; now they also reserve nothing.
+	const int rect_w = (int)rect_max.x - (int)rect_min.x;
+	const int rect_h = (int)rect_max.y - (int)rect_min.y;
+	if (rect_w <= 0 || rect_h <= 0)
 		return;
-	int my_radius = max(rect_max.x - rect_min.x, rect_max.y - rect_min.y);
+	int my_radius = max(rect_w, rect_h);
 
 	// If colors have been precomputed, use them, otherwise convert
 	// spherical harmonics coefficients to RGB color.
@@ -961,7 +973,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	pbf_id[idx * 4 + 3] = screen_grid_aligned_pbf.w;
 
 	pbf_tan[idx] = tan_xxyy;
-	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+	tiles_touched[idx] = (uint32_t)(rect_w * rect_h);
 }
 
 // Main rasterization method. Collaboratively works on one tile per

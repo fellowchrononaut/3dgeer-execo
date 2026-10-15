@@ -154,7 +154,15 @@ __global__ void duplicateWithKeys(
 // Check keys to see if it is at the start/end of one tile's range in 
 // the full sorted list. If yes, write start/end of this tile. 
 // Run once per instanced (duplicated) Gaussian ID.
-__global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* ranges)
+// Count of sort keys whose tile ID is out of range (see forward(): the key
+// buffer is pre-filled with a 0xFF sentinel, so any slot duplicateWithKeys
+// leaves unwritten decodes to tile 0xFFFFFFFF). Previously such garbage tile
+// IDs made ranges[key>>32] write out of bounds -- the stochastic "illegal
+// memory access" (GUTWrap memory: EQ rasterizer heisenbug; initcheck found
+// uninitialized key reads in SortPairs, 2026-07-09). Diagnostic + guard.
+__device__ unsigned long long g_bad_tile_keys = 0;
+
+__global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* ranges, uint32_t num_tiles)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= L)
@@ -163,6 +171,23 @@ __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* rang
 	// Read tile ID from key. Update start/end of tile range if at limit.
 	uint64_t key = point_list_keys[idx];
 	uint32_t currtile = key >> 32;
+	if (currtile >= num_tiles)
+	{
+		// Sentinel/garbage keys sort after every valid tile; skip them. The
+		// last valid tile's end is set below by the first invalid key.
+		unsigned long long old = atomicAdd(&g_bad_tile_keys, 1ULL);
+		if ((old & (old + 1)) == 0)   // report at 1, 2, 4, 8, ... occurrences
+			printf("[geer-rasterizer] identifyTileRanges: %llu sort key(s) with tile id >= %u so far "
+			       "(this one: tile %u at %d of %d) -- skipped (unwritten/garbage key slot)\n",
+			       old + 1, num_tiles, currtile, (int)idx, L);
+		if (idx > 0)
+		{
+			uint32_t prevtile = point_list_keys[idx - 1] >> 32;
+			if (prevtile < num_tiles)
+				ranges[prevtile].y = idx;
+		}
+		return;
+	}
 	if (idx == 0)
 		ranges[currtile].x = 0;
 	else
@@ -170,7 +195,8 @@ __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* rang
 		uint32_t prevtile = point_list_keys[idx - 1] >> 32;
 		if (currtile != prevtile)
 		{
-			ranges[prevtile].y = idx;
+			if (prevtile < num_tiles)
+				ranges[prevtile].y = idx;
 			ranges[currtile].x = idx;
 		}
 	}
@@ -395,6 +421,15 @@ int CudaRasterizer::Rasterizer::forward(
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
+	// Pre-fill keys/values with a 0xFF sentinel: a slot duplicateWithKeys does
+	// not write decodes to tile 0xFFFFFFFF, sorts last, and is skipped (and
+	// counted) by identifyTileRanges instead of indexing ranges[] out of bounds.
+	if (num_rendered > 0)
+	{
+		CHECK_CUDA(cudaMemset(binningState.point_list_keys_unsorted, 0xFF, (size_t)num_rendered * sizeof(uint64_t)), debug);
+		CHECK_CUDA(cudaMemset(binningState.point_list_unsorted, 0xFF, (size_t)num_rendered * sizeof(uint32_t)), debug);
+	}
+
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
 	// and corresponding dublicated Gaussian indices to be sorted
 	cudaEventRecord(duplicateStart, 0);
@@ -441,7 +476,8 @@ int CudaRasterizer::Rasterizer::forward(
 		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
 			num_rendered,
 			binningState.point_list_keys,
-			imgState.ranges);
+			imgState.ranges,
+			(uint32_t)(tile_grid.x * tile_grid.y));
 	CHECK_CUDA(, debug)
 
 	// ranges for each tile

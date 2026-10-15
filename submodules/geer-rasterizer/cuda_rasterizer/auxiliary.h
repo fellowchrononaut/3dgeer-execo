@@ -152,11 +152,11 @@ __forceinline__ __device__ uint32_t duplicateToTilesTouched(
 
 	getRect2(pbf, rect_min, rect_max, grid);
 
-	int y_span = rect_max.y - rect_min.y;
-	int x_span = rect_max.x - rect_min.x;
+	int y_span = (int)rect_max.y - (int)rect_min.y;
+	int x_span = (int)rect_max.x - (int)rect_min.x;
 
-	// If no tiles are touched, return 0
-	if (y_span * x_span == 0) {
+	// If no tiles are touched (or the PBF is inverted, see forward.cu), return 0
+	if (y_span <= 0 || x_span <= 0) {
 		return 0;
 	}
 
