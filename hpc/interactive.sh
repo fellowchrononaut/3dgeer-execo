@@ -9,6 +9,8 @@
 #
 # gpu01 is effectively uncontended (one other GPU user over the last 14 days,
 # no QOS caps), so the full H200 is usually the right default even for debugging.
+# No --mem means "all of the node's memory" on MODUS: such a job waits until gpu01 is
+# completely free, even for a MIG slice. MEM overrides the 64G default.
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/env.sh"
 
@@ -22,7 +24,7 @@ case "${KIND}" in
 esac
 
 echo "==> salloc ${GRES} for ${HOURS}h"
-salloc -N 1 -p gpu --gres="${GRES}" --cpus-per-task="${CPUS}" \
+salloc -N 1 -p gpu --gres="${GRES}" --cpus-per-task="${CPUS}" --mem="${MEM:-64G}" \
     --time="${HOURS}:00:00" -- \
     bash -c "
         module load ${APPTAINER_MODULE}

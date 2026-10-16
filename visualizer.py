@@ -158,7 +158,6 @@ if __name__ == "__main__":
     parser.add_argument('--mirror_shift', type=float, default=0.0)
     parser.add_argument('--raymap_path', type=str, default=None,
                         help="Path to pre-generated raymap .npy file (required for KB mode)")
-    parser.add_argument('--near_threshold', type=float, default=0.2)
 
     args = get_combined_args(parser)
 

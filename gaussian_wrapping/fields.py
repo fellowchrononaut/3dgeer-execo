@@ -255,7 +255,7 @@ def _build_raster_settings(camera, pc, pipe, bg_color: torch.Tensor) -> Gaussian
         debug=pipe.debug,
         antialiasing=pipe.antialiasing,
         render_mode=camera.render_model,
-        near_threshold=0.2,
+        near_threshold=getattr(pipe, "near_threshold", 0.2),
         asso_mode=0,
     )
 

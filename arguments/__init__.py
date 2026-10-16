@@ -75,6 +75,12 @@ class PipelineParams(ParamGroup):
         self.compute_cov3D_python = False
         self.debug = False
         self.antialiasing = False
+        # Rasterizer near culling: > 0 = pinhole near plane (Gaussians with
+        # view-space z <= value are dropped; 3DGS default 0.2); < 0 = cull by
+        # distance along the ray (|p| <= -value) plus z > 0.01 |p|. Use < 0 for
+        # KB/EQ fisheyes: the z-plane culls close geometry towards 90 deg
+        # (black spots straight up/down, blurred 85-90 deg band).
+        self.near_threshold = 0.2
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):

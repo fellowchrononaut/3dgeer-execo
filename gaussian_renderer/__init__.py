@@ -16,7 +16,7 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.general_utils import build_rotation
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, use_trained_exp=False, near_threshold=0.2, asso_mode=0, clamp_output=True):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, use_trained_exp=False, near_threshold=None, asso_mode=0, clamp_output=True):
     """
     Render the scene. 
     
@@ -78,7 +78,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         debug=pipe.debug,
         antialiasing=pipe.antialiasing,
         render_mode=viewpoint_camera.render_model,
-        near_threshold=near_threshold,
+        near_threshold=near_threshold if near_threshold is not None else getattr(pipe, "near_threshold", 0.2),
         asso_mode=asso_mode
     )
 

@@ -319,7 +319,21 @@ __forceinline__ __device__ bool in_frustum(int idx,
 	// Bring points to screen space 
 	p_view = transformPoint4x3(p_orig, viewmatrix);
 
- 	if (p_view.z <= near_threshold)
+	// near_threshold > 0: the pinhole near plane, z <= near_threshold is culled
+	// (3DGS default). near_threshold < 0: fisheye-friendly culling by distance
+	// along the ray, |p| <= -near_threshold, plus z > 0.01 |p| (within ~89.4 deg
+	// of the axis): the tangent-space bounds (computePBF) need z clearly > 0.
+	// A z-plane wrongly culls near geometry towards 90 deg, where z = |p| cos(theta)
+	// is small however close the point is.
+	bool culled;
+	if (near_threshold >= 0.f)
+		culled = p_view.z <= near_threshold;
+	else
+	{
+		const float dist = sqrtf(p_view.x * p_view.x + p_view.y * p_view.y + p_view.z * p_view.z);
+		culled = (dist <= -near_threshold) || (p_view.z <= 0.01f * dist);
+	}
+ 	if (culled)
 	{
 		if (prefiltered)
 		{

@@ -32,7 +32,7 @@ from utils.raymap_utils import load_raymap
 
 def build_scene(source_path, model_path, dataset_type, camera_model, iteration,
                  render_model, sample_step=0.002, focal_scaling=1.0,
-                 distortion_scaling=1.0, mirror_shift=0.0, raymap_path=None):
+                 distortion_scaling=1.0, mirror_shift=0.0, raymap_path=None, near_threshold=0.2):
     parser = ArgumentParser()
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
@@ -46,6 +46,7 @@ def build_scene(source_path, model_path, dataset_type, camera_model, iteration,
     dataset = lp.extract(args)
     opt = op.extract(args)
     pipe = pp.extract(args)
+    pipe.near_threshold = near_threshold   # rasterizer near culling (< 0: by ray distance, for fisheyes)
 
     # mirror train.py:40-49 / tests/test_normal_field.py::build_scene
     dataset.fov_mod = None
@@ -78,6 +79,8 @@ def main():
     parser.add_argument("--distortion_scaling", type=float, default=1.0)
     parser.add_argument("--mirror_shift", type=float, default=0.0)
     parser.add_argument("--raymap_path", type=str, default=None)
+    parser.add_argument("--near_threshold", type=float, default=0.2,
+                        help="rasterizer near culling, as in training (PipelineParams); < 0 = by ray distance")
 
     parser.add_argument("--iso", type=float, default=0.0)
     # Session E2.1: GW's actual "ours"-script default is 3.0; 3.33 is only
@@ -146,6 +149,7 @@ def main():
         distortion_scaling=args.distortion_scaling,
         mirror_shift=args.mirror_shift,
         raymap_path=args.raymap_path,
+        near_threshold=args.near_threshold,
     )
     print(f"[extract_mesh] loaded {gaussians.get_xyz.shape[0]} Gaussians from "
           f"{args.model_path} @ iteration {args.iteration}")
