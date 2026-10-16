@@ -6,14 +6,24 @@ import torch
 import torch.nn.functional as F
 
 
+# KB/EQ ray directions shared by every camera of the same raymap (one per
+# lens): a per-camera cache held a 3xHxW float copy for each image on the
+# GPU (44 MB at 1920^2, ~17 GB over 382 images once multiview had touched them).
+_KB_RAY_DIRS = {}
+
+
 def get_ray_dirs_view(camera):
-    """(3,H,W) unit ray directions in view space. Cached on the camera."""
-    if getattr(camera, "_ray_dirs_view", None) is not None:
-        return camera._ray_dirs_view
+    """(3,H,W) unit ray directions in view space. Cached per raymap (KB/EQ)
+    or on the camera (PH/BEAP)."""
     H, W = camera.image_height, camera.image_width
     if camera.render_model == 1:          # KB/EQ: per-pixel raymap (H,W,3)
-        dirs = camera.raymap.cuda().permute(2, 0, 1).float()
-    elif camera.render_model == 2:        # PH: analytic pinhole rays
+        key = (camera.raymap.data_ptr(), H, W)
+        if key not in _KB_RAY_DIRS:
+            _KB_RAY_DIRS[key] = F.normalize(camera.raymap.cuda().permute(2, 0, 1).float(), dim=0)
+        return _KB_RAY_DIRS[key]
+    if getattr(camera, "_ray_dirs_view", None) is not None:
+        return camera._ray_dirs_view
+    if camera.render_model == 2:          # PH: analytic pinhole rays
         ys, xs = torch.meshgrid(torch.arange(H, device="cuda"),
                                  torch.arange(W, device="cuda"), indexing="ij")
         dirs = torch.stack([(xs + 0.5) / camera.focal_x - W / (2.0 * camera.focal_x),

@@ -24,10 +24,15 @@ def multiview_ncc_forward(
     fy_n: float,
     cx_n: float,
     cy_n: float,
+    k1_n: float,
+    k2_n: float,
+    k3_n: float,
+    k4_n: float,
     patch_radius: int,
     debug: bool = False,
 ):
-    """Forward-only EQ/PH-general multiview patch-NCC. Returns (ncc (P,),
+    """Forward-only KB/EQ/PH-general multiview patch-NCC (k1_n..k4_n: the neighbour's
+    KB radial coefficients, zeros for EQ/PH). Returns (ncc (P,),
     valid (P,) bool). No gradients attached here -- see
     utils/multiview.py::EQWarpPatchNCC for the finite-difference
     torch.autograd.Function wrapper used in training."""
@@ -42,6 +47,7 @@ def multiview_ncc_forward(
         image_n.contiguous(),
         int(render_model_n),
         float(fx_n), float(fy_n), float(cx_n), float(cy_n),
+        float(k1_n), float(k2_n), float(k3_n), float(k4_n),
         int(patch_radius),
         bool(debug),
     )
@@ -62,6 +68,10 @@ def multiview_ncc_backward(
     fy_n: float,
     cx_n: float,
     cy_n: float,
+    k1_n: float,
+    k2_n: float,
+    k3_n: float,
+    k4_n: float,
     patch_radius: int,
     grad_ncc: torch.Tensor,
     precise: bool = True,
@@ -88,6 +98,7 @@ def multiview_ncc_backward(
         image_n.contiguous(),
         int(render_model_n),
         float(fx_n), float(fy_n), float(cx_n), float(cy_n),
+        float(k1_n), float(k2_n), float(k3_n), float(k4_n),
         int(patch_radius),
         grad_ncc.contiguous(),
         bool(precise),

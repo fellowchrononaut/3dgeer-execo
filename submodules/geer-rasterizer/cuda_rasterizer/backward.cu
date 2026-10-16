@@ -288,6 +288,16 @@ __global__ void preprocessCUDA_mah(
 		computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, shs, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_dsh);
 }
 
+// Per-ray PBF test, the exact expression of forward.cu renderCUDA (mode 1).
+__forceinline__ __device__ bool in_pbf_tan(const float3 rayf, const float4 b_xxyy)
+{
+	if (((rayf.x / rayf.z) < b_xxyy.x) || ((rayf.x / rayf.z) > b_xxyy.y))
+		return false;
+	if (((rayf.y / rayf.z) < b_xxyy.z) || ((rayf.y / rayf.z) > b_xxyy.w))
+		return false;
+	return true;
+}
+
 // Backward version of the rendering procedure.
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
@@ -298,6 +308,7 @@ renderCUDA(
 	const float* tan_theta,
 	const float* tan_phi,
 	const float* __restrict__ raymap,
+	const float4* __restrict__ pbf_tan,
 	const float focal_x,
 	const float focal_y,
 	const int mode,
@@ -362,6 +373,7 @@ renderCUDA(
 	__shared__ float3 collected_w2o[BLOCK_SIZE * 3];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 	__shared__ float collected_depths[BLOCK_SIZE];
+	__shared__ float4 collected_pbf_tan[BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
@@ -422,6 +434,7 @@ renderCUDA(
 				collected_id[thread_idx] = coll_id;
 				collected_xyz[thread_idx] = points_xyz_view[coll_id];
 				collected_h_opacity[thread_idx] = h_opacity[coll_id];
+				collected_pbf_tan[thread_idx] = pbf_tan[coll_id];
 				for (int jj = 0; jj < 3; jj++)
 					collected_w2o[thread_idx * 3 + jj] = w2o[coll_id * 3 + jj];
 			}
@@ -429,6 +442,7 @@ renderCUDA(
 			for (int j = 0; !med_done && j < min(BLOCK_SIZE, med_toDo); j++) {
 				if (med_idx >= last_contributor) { med_done = true; continue; }
 				med_idx++;
+				if (mode == 1 && !in_pbf_tan(rayf, collected_pbf_tan[j])) continue;
 				const float3 xyz_m = collected_xyz[j];
 				const float2 h_o_m = collected_h_opacity[j];
 				float3* w2o_rows_m = collected_w2o + j * 3;
@@ -491,6 +505,7 @@ renderCUDA(
 			collected_xyz[thread_idx] = points_xyz_view[coll_id];  
 
 			collected_h_opacity[thread_idx] = h_opacity[coll_id];
+			collected_pbf_tan[thread_idx] = pbf_tan[coll_id];
 			for (int j = 0; j < 3; j++) {
 				collected_w2o[thread_idx * 3 + j] = w2o[coll_id * 3 + j];  
 			}
@@ -510,6 +525,15 @@ renderCUDA(
 			// is behind the last contributor for this pixel.
 			contributor--;
 			if (contributor >= last_contributor)
+				continue;
+
+			// Same per-ray PBF test as the forward renderCUDA (KB/EQ): a
+			// Gaussian the forward skipped on this ray must be skipped here
+			// too, or T = T / (1 - alpha) replays alphas that were never
+			// composited. Near/beyond 90 deg (rayf.z <= 0) those alphas are
+			// large and T overflows to inf -> NaN gradients for every
+			// parameter of the Gaussians on that pixel.
+			if (mode == 1 && !in_pbf_tan(rayf, collected_pbf_tan[j]))
 				continue;
 
 			// Compute blending values, as before.
@@ -738,6 +762,7 @@ void BACKWARD::render(
 	const float* tan_theta,  
 	const float* tan_phi,
 	const float* raymap,
+	const float4* pbf_tan,
 	const float focal_x, const float focal_y,
 	const int mode,
 	const float* bg_color,
@@ -765,6 +790,7 @@ void BACKWARD::render(
 		W, H,
 		tan_theta, tan_phi,
 		raymap,
+		pbf_tan,
 		focal_x, focal_y,
 		mode,
 		bg_color,

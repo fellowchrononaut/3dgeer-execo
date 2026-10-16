@@ -424,7 +424,7 @@ class EQWarpPatchNCC(torch.autograd.Function):
     @staticmethod
     def forward(ctx, depths, normals, uvs, ray_dirs_r, R, T, image_r, image_n,
                  render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius,
-                 eps_depth=3e-2, eps_normal=3e-2):
+                 eps_depth=3e-2, eps_normal=3e-2, dist_n=None):
         if not _HAVE_MULTIVIEW_NCC_EXT:
             raise RuntimeError(
                 "multiview_ncc CUDA extension not built -- see "
@@ -438,6 +438,9 @@ class EQWarpPatchNCC(torch.autograd.Function):
         # the next innocent torch op); MULTIVIEW_NCC_CAPTURE=<path> snapshots
         # every call's exact inputs to CPU and dumps the failing batch on
         # RuntimeError for standalone compute-sanitizer replay.
+        # Neighbour lens model: KB k1..k4 (camera.distortion_coeffs; zeros for EQ/PH).
+        k_n = _kb_coeffs(dist_n, render_model_n)
+
         _dbg = _os.environ.get("MULTIVIEW_NCC_DEBUG", "0") == "1"
         _cap_path = _os.environ.get("MULTIVIEW_NCC_CAPTURE", "")
 
@@ -450,12 +453,12 @@ class EQWarpPatchNCC(torch.autograd.Function):
                     "R": R.detach().cpu(), "T": T.detach().cpu(),
                     "image_r": image_r.detach().cpu(), "image_n": image_n.detach().cpu(),
                     "render_model_n": render_model_n, "fx_n": fx_n, "fy_n": fy_n,
-                    "cx_n": cx_n, "cy_n": cy_n, "patch_radius": patch_radius,
+                    "cx_n": cx_n, "cy_n": cy_n, "k_n": k_n, "patch_radius": patch_radius,
                 }
             try:
                 return _multiview_ncc_ext.multiview_ncc_forward(
                     d, n, uvs, ray_dirs_r, R, T, image_r, image_n,
-                    render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius,
+                    render_model_n, fx_n, fy_n, cx_n, cy_n, *k_n, patch_radius,
                     _dbg,
                 )
             except RuntimeError:
@@ -469,7 +472,7 @@ class EQWarpPatchNCC(torch.autograd.Function):
         mode = MULTIVIEW_NCC_BACKWARD
         ctx.backward_mode = mode
         if mode == "analytic":
-            ctx.kernel_args = (render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius)
+            ctx.kernel_args = (render_model_n, fx_n, fy_n, cx_n, cy_n, k_n, patch_radius)
             ctx.save_for_backward(depths, normals, uvs, ray_dirs_r, R, T,
                                   image_r, image_n)
             return ncc, valid
@@ -495,21 +498,21 @@ class EQWarpPatchNCC(torch.autograd.Function):
         if ctx.backward_mode == "analytic":
             (depths, normals, uvs, ray_dirs_r, R, T,
              image_r, image_n) = ctx.saved_tensors
-            render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius = ctx.kernel_args
+            render_model_n, fx_n, fy_n, cx_n, cy_n, k_n, patch_radius = ctx.kernel_args
             grad_depths, grad_normals = _multiview_ncc_ext.multiview_ncc_backward(
                 depths, normals, uvs, ray_dirs_r, R, T, image_r, image_n,
-                render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius,
+                render_model_n, fx_n, fy_n, cx_n, cy_n, *k_n, patch_radius,
                 grad_ncc.contiguous().float(),
                 precise=MULTIVIEW_NCC_ANALYTIC_PRECISE,
             )
             # The analytic kernel already multiplies by the upstream grad_ncc
             # inside the kernel (g_upstream), so return its outputs directly.
-            return (grad_depths, grad_normals) + (None,) * 14
+            return (grad_depths, grad_normals) + (None,) * 15
 
         grad_depths, grad_normals = ctx.saved_tensors
-        # 16 forward inputs (depths, normals, uvs, ray_dirs_r, R, T, image_r,
+        # 17 forward inputs (depths, normals, uvs, ray_dirs_r, R, T, image_r,
         # image_n, render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius,
-        # eps_depth, eps_normal) -> 16 return values, grad only for the first two.
+        # eps_depth, eps_normal, dist_n) -> 17 return values, grad only for the first two.
         return (
             grad_ncc * grad_depths,
             grad_ncc.unsqueeze(-1) * grad_normals,
@@ -527,14 +530,26 @@ class EQWarpPatchNCC(torch.autograd.Function):
             None,  # patch_radius
             None,  # eps_depth
             None,  # eps_normal
+            None,  # dist_n
         )
+
+
+def _kb_coeffs(dist_n, render_model_n):
+    """(k1, k2, k3, k4) floats for the NCC kernel: the neighbour camera's
+    distortion_coeffs for KB/EQ (render_model 1), zeros otherwise or if absent."""
+    if render_model_n != 1 or dist_n is None:
+        return (0.0, 0.0, 0.0, 0.0)
+    k = [float(v) for v in (dist_n.tolist() if hasattr(dist_n, "tolist") else dist_n)]
+    return tuple((k + [0.0] * 4)[:4])
 
 
 def eq_warp_patch_ncc(depths, normals, uvs, ray_dirs_r, R, T, image_r, image_n,
                        render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius,
-                       eps_depth=3e-2, eps_normal=3e-2):
+                       eps_depth=3e-2, eps_normal=3e-2, dist_n=None):
+    """dist_n: the neighbour camera's KB coefficients (camera.distortion_coeffs);
+    None = undistorted equidistant (EQ) / pinhole."""
     return EQWarpPatchNCC.apply(
         depths, normals, uvs, ray_dirs_r, R, T, image_r, image_n,
         render_model_n, fx_n, fy_n, cx_n, cy_n, patch_radius,
-        eps_depth, eps_normal,
+        eps_depth, eps_normal, dist_n,
     )

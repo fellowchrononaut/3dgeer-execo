@@ -659,6 +659,7 @@ void CudaRasterizer::Rasterizer::backward(
 		width, height,
 		tan_theta, tan_phi,
 		raymap,
+		geomState.pbf_tan,
 		focal_x, focal_y,
 		mode,
 		background,

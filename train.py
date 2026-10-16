@@ -68,6 +68,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
+        # Checkpoints written before the backward PBF fix (geer-rasterizer
+        # backward.cu in_pbf_tan) can hold Gaussians whose every parameter
+        # is NaN; the rasterizer skips them, but any loss over all Gaussians
+        # (--flatten_weight) turns NaN. Drop them on load.
+        nonfinite = torch.zeros(gaussians.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+        for p in (gaussians._xyz, gaussians._features_dc, gaussians._features_rest,
+                  gaussians._scaling, gaussians._rotation, gaussians._opacity, gaussians._normals):
+            nonfinite |= ~torch.isfinite(p.detach()).reshape(p.shape[0], -1).all(dim=1)
+        if nonfinite.any():
+            print(f"[restore] pruning {int(nonfinite.sum())} non-finite Gaussians of {nonfinite.numel()}")
+            gaussians.prune_points(nonfinite)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -353,6 +364,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         neighbor_cam.focal_x, neighbor_cam.focal_y,
                         neighbor_cam.principal_x, neighbor_cam.principal_y,
                         opt.multiview_patch_size,
+                        dist_n=neighbor_cam.distortion_coeffs,
                     )
                     # 1 - correlation, weighted by the same geo-consistency
                     # weights, poor-match rejection (ncc_term>=0.9) -- mirrors

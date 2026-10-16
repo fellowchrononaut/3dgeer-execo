@@ -16,6 +16,24 @@
 
 #define EQ_MAX_THETA 1.5533430342749535f  // 89 degrees in radians
 
+// Kannala-Brandt / OpenCV-fisheye radial model, as fisheye_proj.py and the ray
+// maps (tools/fisheye_raymap.py): theta_d = theta (1 + k1 t^2 + k2 t^4 + k3 t^6 + k4 t^8).
+// k = 0 is the plain equidistant model.
+__device__ __forceinline__ float kb_theta_d(float t, float k1, float k2, float k3, float k4) {
+    const float t2 = t * t;
+    return t * (1.f + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))));
+}
+template <typename T>
+__device__ __forceinline__ T kb_theta_d_t(T t, T k1, T k2, T k3, T k4) {
+    const T t2 = t * t;
+    return t * (T(1) + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))));
+}
+template <typename T>
+__device__ __forceinline__ T kb_dtheta_d_t(T t, T k1, T k2, T k3, T k4) {   // d(theta_d)/d(theta)
+    const T t2 = t * t;
+    return T(1) + t2 * (T(3) * k1 + t2 * (T(5) * k2 + t2 * (T(7) * k3 + t2 * T(9) * k4)));
+}
+
 struct Float3 {
     float x, y, z;
 };
@@ -84,10 +102,11 @@ __device__ __forceinline__ float bilinear_sample(const float* img, int H, int W,
 
 // Project a neighbor-view-space point to the neighbor camera's pixel coords.
 // Mirrors gaussian_wrapping/fisheye_proj.py::project_view_to_pixel exactly
-// (PH branch and undistorted-EQ branch), ported to CUDA math intrinsics.
+// (PH branch and KB/EQ branch incl. the radial polynomial), ported to CUDA math intrinsics.
 __device__ __forceinline__ bool project_to_neighbor_pixel(
     const Float3& x, const int render_model_n,
     const float fx_n, const float fy_n, const float cx_n, const float cy_n,
+    const float k1_n, const float k2_n, const float k3_n, const float k4_n,
     const int Wn, const int Hn,
     float& u_out, float& v_out) {
     if (render_model_n == 2) {  // PH (pinhole)
@@ -98,12 +117,16 @@ __device__ __forceinline__ bool project_to_neighbor_pixel(
         return valid_z
                && u_out >= -0.5f && u_out <= Wn - 0.5f
                && v_out >= -0.5f && v_out <= Hn - 0.5f;
-    } else {  // KB/EQ (equidistant fisheye, undistorted)
+    } else {  // KB/EQ fisheye (KB radial model; EQ = all k zero)
+        // No -0.5 here: KB/EQ principal points are in the integer-pixel-centre
+        // convention of the ray maps (fisheye_proj.py docstring); the -0.5 was a
+        // copy of the PH branch's COLMAP->index shift and biased sampling by 0.5 px.
         float r     = sqrtf(x.x * x.x + x.y * x.y);
         float theta = atan2f(r, x.z);
         float phi   = atan2f(x.y, x.x);
-        u_out       = cx_n + fx_n * theta * cosf(phi) - 0.5f;
-        v_out       = cy_n + fy_n * theta * sinf(phi) - 0.5f;
+        float th_d  = kb_theta_d(theta, k1_n, k2_n, k3_n, k4_n);
+        u_out       = cx_n + fx_n * th_d * cosf(phi);
+        v_out       = cy_n + fy_n * th_d * sinf(phi);
         return theta < EQ_MAX_THETA
                && u_out >= -0.5f && u_out <= Wn - 0.5f
                && v_out >= -0.5f && v_out <= Hn - 0.5f;
@@ -122,6 +145,7 @@ __global__ void multiview_ncc_forward_kernel(
     const float* __restrict__ image_n,
     const int render_model_n,
     const float fx_n, const float fy_n, const float cx_n, const float cy_n,
+    const float k1_n, const float k2_n, const float k3_n, const float k4_n,
     const int Hr, const int Wr,
     const int Hn, const int Wn,
     const int radius,
@@ -173,7 +197,7 @@ __global__ void multiview_ncc_forward_kernel(
 
             float u_n, v_n;
             const bool proj_valid = project_to_neighbor_pixel(
-                Xn, render_model_n, fx_n, fy_n, cx_n, cy_n, Wn, Hn, u_n, v_n);
+                Xn, render_model_n, fx_n, fy_n, cx_n, cy_n, k1_n, k2_n, k3_n, k4_n, Wn, Hn, u_n, v_n);
             all_inside = all_inside && proj_valid && !bad;
 
             const float c_n = bilinear_sample(image_n, Hn, Wn, u_n, v_n);
@@ -212,6 +236,7 @@ void multiview_ncc_forward_launcher(
     const int render_model_n,
     const float fx_n, const float fy_n,
     const float cx_n, const float cy_n,
+    const float k1_n, const float k2_n, const float k3_n, const float k4_n,
     const int Hr, const int Wr,
     const int Hn, const int Wn,
     const int patch_radius,
@@ -231,7 +256,7 @@ void multiview_ncc_forward_launcher(
         image_r,
         image_n,
         render_model_n,
-        fx_n, fy_n, cx_n, cy_n,
+        fx_n, fy_n, cx_n, cy_n, k1_n, k2_n, k3_n, k4_n,
         Hr, Wr, Hn, Wn,
         patch_radius,
         ncc,
@@ -339,7 +364,7 @@ __device__ __forceinline__ Vec3<T> matvec3t(const float* R, const Vec3<T>& v) {
 
 // EQ projection via the exact identity cos(phi) = x/r, sin(phi) = y/r
 // (r > 0), avoiding the atan2(y,x)+cos+sin of the forward kernel entirely:
-//   u = cx + fx*theta*(x/r) - 0.5,  v = cy + fy*theta*(y/r) - 0.5.
+//   u = cx + fx*theta_d*(x/r),  v = cy + fy*theta_d*(y/r)  (theta_d: KB radial model).
 // Identical real-valued function as project_to_neighbor_pixel (the r->0
 // limit of theta*(x/r) is 0 either way, since theta ~ r/z); also hands back
 // r and theta for the Jacobian in Pass B.
@@ -347,13 +372,15 @@ template <typename T>
 __device__ __forceinline__ bool project_eq_identity(
     const Vec3<T>& x,
     const T fx_n, const T fy_n, const T cx_n, const T cy_n,
+    const T k1_n, const T k2_n, const T k3_n, const T k4_n,
     const int Wn, const int Hn,
     T& u_out, T& v_out, T& r_out, T& theta_out) {
     const T r     = sqrt(x.x * x.x + x.y * x.y);
     const T theta = atan2(r, x.z);
+    const T th_d  = kb_theta_d_t<T>(theta, k1_n, k2_n, k3_n, k4_n);
     const T inv_r = T(1) / max(r, T(1e-12));
-    u_out     = cx_n + fx_n * theta * (x.x * inv_r) - T(0.5);
-    v_out     = cy_n + fy_n * theta * (x.y * inv_r) - T(0.5);
+    u_out     = cx_n + fx_n * th_d * (x.x * inv_r);   // no -0.5, see project_to_neighbor_pixel
+    v_out     = cy_n + fy_n * th_d * (x.y * inv_r);
     r_out     = r;
     theta_out = theta;
     return theta < (T)EQ_MAX_THETA
@@ -443,7 +470,9 @@ __device__ __forceinline__ Jac2x3<T> ph_projection_jacobian(const Vec3<T>& x, T 
 }
 
 // EQ Jacobian. theta = atan2(r,z), r = sqrt(x^2+y^2), cphi = x/r, sphi = y/r;
-// u = cx+fx*theta*cphi, v = cy+fy*theta*sphi. Symbolic form (R2 = r^2+z^2):
+// u = cx+fx*theta*cphi, v = cy+fy*theta*sphi (shown for EQ; KB below scales the
+// theta-derivative terms by d(theta_d)/d(theta) and uses theta_d in the phi terms).
+// Symbolic form (R2 = r^2+z^2):
 //   du/dx = fx*( z*x*cphi/(r*R2) + theta*y^2/r^3 )
 //   du/dy = fx*( z*y*cphi/(r*R2) - theta*x*y/r^3 )
 //   du/dz = -fx*r*cphi/R2
@@ -456,7 +485,7 @@ __device__ __forceinline__ Jac2x3<T> ph_projection_jacobian(const Vec3<T>& x, T 
 // r/rho^2 denominators at a small epsilon rather than dividing by zero.
 template <typename T>
 __device__ __forceinline__ Jac2x3<T> eq_projection_jacobian(
-    const Vec3<T>& x, T fx, T fy, T r, T theta) {
+    const Vec3<T>& x, T fx, T fy, T r, T theta, T d1, T d2, T d3, T d4) {
     const T rho2      = r * r;
     const T r_safe    = max(r, T(1e-9));
     const T rho2_safe = max(rho2, T(1e-18));
@@ -468,13 +497,18 @@ __device__ __forceinline__ Jac2x3<T> eq_projection_jacobian(
     const T k1        = x.z * inv_r * inv_R2;  // d(theta)/dr / r  (radial factor)
     const T k2        = T(1) / rho2_safe;       // used for d(phi)/d(x,y)
 
+    // KB: u = cx + fx*theta_d(theta)*cphi. The theta-derivative terms (k1, du_dz)
+    // pick up d(theta_d)/d(theta); the phi terms use theta_d instead of theta.
+    const T td  = kb_theta_d_t<T>(theta, d1, d2, d3, d4);
+    const T dtd = kb_dtheta_d_t<T>(theta, d1, d2, d3, d4);
+
     Jac2x3<T> J;
-    J.du_dx = fx * (k1 * x.x * cphi + theta * sphi * k2 * x.y);
-    J.du_dy = fx * (k1 * x.y * cphi - theta * sphi * k2 * x.x);
-    J.du_dz = fx * (-r * inv_R2) * cphi;
-    J.dv_dx = fy * (k1 * x.x * sphi - theta * cphi * k2 * x.y);
-    J.dv_dy = fy * (k1 * x.y * sphi + theta * cphi * k2 * x.x);
-    J.dv_dz = fy * (-r * inv_R2) * sphi;
+    J.du_dx = fx * (dtd * k1 * x.x * cphi + td * sphi * k2 * x.y);
+    J.du_dy = fx * (dtd * k1 * x.y * cphi - td * sphi * k2 * x.x);
+    J.du_dz = fx * dtd * (-r * inv_R2) * cphi;
+    J.dv_dx = fy * (dtd * k1 * x.x * sphi - td * cphi * k2 * x.y);
+    J.dv_dy = fy * (dtd * k1 * x.y * sphi + td * cphi * k2 * x.x);
+    J.dv_dz = fy * dtd * (-r * inv_R2) * sphi;
     return J;
 }
 
@@ -491,6 +525,7 @@ __global__ void multiview_ncc_backward_kernel(
     const float* __restrict__ image_n,
     const int render_model_n,
     const float fx_nf, const float fy_nf, const float cx_nf, const float cy_nf,
+    const float k1_nf, const float k2_nf, const float k3_nf, const float k4_nf,
     const int Hr, const int Wr,
     const int Hn, const int Wn,
     const int radius,
@@ -512,6 +547,7 @@ __global__ void multiview_ncc_backward_kernel(
     }
 
     const T fx_n = fx_nf, fy_n = fy_nf, cx_n = cx_nf, cy_n = cy_nf;
+    const T k1_n = k1_nf, k2_n = k2_nf, k3_n = k3_nf, k4_n = k4_nf;
 
     const T depth          = depths[idx];
     const Vec3<T> normal   = v3_of<T>(normals[idx]);
@@ -558,7 +594,7 @@ __global__ void multiview_ncc_backward_kernel(
                              && v_n >= T(-0.5) && v_n <= T(Hn) - T(0.5);
             } else {  // KB/EQ
                 proj_valid = project_eq_identity<T>(
-                    Xn, fx_n, fy_n, cx_n, cy_n, Wn, Hn, u_n, v_n, r_eq, th_eq);
+                    Xn, fx_n, fy_n, cx_n, cy_n, k1_n, k2_n, k3_n, k4_n, Wn, Hn, u_n, v_n, r_eq, th_eq);
             }
             all_inside = all_inside && proj_valid && !bad;
 
@@ -635,7 +671,7 @@ __global__ void multiview_ncc_backward_kernel(
             // derivative along ray_off_n (== dXn/dt) to get d(u,v)/dt.
             Jac2x3<T> J = (render_model_n == 2)
                               ? ph_projection_jacobian<T>(Xn, fx_n, fy_n)
-                              : eq_projection_jacobian<T>(Xn, fx_n, fy_n, st_r[k], st_th[k]);
+                              : eq_projection_jacobian<T>(Xn, fx_n, fy_n, st_r[k], st_th[k], k1_n, k2_n, k3_n, k4_n);
             const T du_dt = J.du_dx * ray_off_n.x + J.du_dy * ray_off_n.y + J.du_dz * ray_off_n.z;
             const T dv_dt = J.dv_dx * ray_off_n.x + J.dv_dy * ray_off_n.y + J.dv_dz * ray_off_n.z;
 
@@ -674,6 +710,7 @@ void multiview_ncc_backward_launcher(
     const int render_model_n,
     const float fx_n, const float fy_n,
     const float cx_n, const float cy_n,
+    const float k1_n, const float k2_n, const float k3_n, const float k4_n,
     const int Hr, const int Wr,
     const int Hn, const int Wn,
     const int patch_radius,
@@ -691,7 +728,7 @@ void multiview_ncc_backward_launcher(
             reinterpret_cast<const int2*>(uvs),
             reinterpret_cast<const Float3*>(ray_dirs_r),
             R, T, image_r, image_n,
-            render_model_n, fx_n, fy_n, cx_n, cy_n,
+            render_model_n, fx_n, fy_n, cx_n, cy_n, k1_n, k2_n, k3_n, k4_n,
             Hr, Wr, Hn, Wn, patch_radius, grad_ncc,
             grad_depths, reinterpret_cast<Float3*>(grad_normals));
     } else {
@@ -701,7 +738,7 @@ void multiview_ncc_backward_launcher(
             reinterpret_cast<const int2*>(uvs),
             reinterpret_cast<const Float3*>(ray_dirs_r),
             R, T, image_r, image_n,
-            render_model_n, fx_n, fy_n, cx_n, cy_n,
+            render_model_n, fx_n, fy_n, cx_n, cy_n, k1_n, k2_n, k3_n, k4_n,
             Hr, Wr, Hn, Wn, patch_radius, grad_ncc,
             grad_depths, reinterpret_cast<Float3*>(grad_normals));
     }

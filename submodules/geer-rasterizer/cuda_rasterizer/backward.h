@@ -28,6 +28,7 @@ namespace BACKWARD
 		const float* tan_theta,
 		const float* tan_phi,
 		const float* raymap,
+		const float4* pbf_tan,
 		const float focal_x, float focal_y,
 		int mode,
 		const float* bg_color,

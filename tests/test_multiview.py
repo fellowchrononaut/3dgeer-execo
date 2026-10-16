@@ -45,6 +45,18 @@ import multiview_ncc as multiview_ncc_ext
 
 torch.manual_seed(0)
 
+# KB lens on the NEIGHBOR camera (render_model 1) for the "KB" variants of the
+# CUDA-vs-oracle and backward checks: deliberately stronger than the X5's
+# (k1 ~ 0.034) so the distortion terms are exercised. None = undistorted EQ.
+NEIGHBOR_KB = None
+KB_TEST = (0.15, -0.04, 0.01, -0.002)
+
+
+def kb_of(cam):
+    """(k1..k4) floats of a camera for the raw extension calls (zeros if none)."""
+    d = getattr(cam, "distortion_coeffs", None)
+    return tuple(float(v) for v in d.tolist()) if d is not None and cam.render_model == 1 else (0.0, 0.0, 0.0, 0.0)
+
 
 def make_camera(render_model, R, T, W, H, focal=140.0, fov_deg=70.0):
     """Build a minimal SimpleNamespace camera object with everything
@@ -120,6 +132,8 @@ def build_flat_scene(render_model, W=160, H=120, plane_z=8.0, neighbor_deg=6.0, 
     R_n = np.array([[math.cos(a), 0, math.sin(a)], [0, 1, 0], [-math.sin(a), 0, math.cos(a)]], dtype=np.float64)
     T_n = np.array([neighbor_t, 0.0, 0.0], dtype=np.float64)
     neighbor_cam = make_camera(render_model, R_n, T_n, W, H)
+    if render_model == 1 and NEIGHBOR_KB is not None:
+        neighbor_cam.distortion_coeffs = torch.tensor(NEIGHBOR_KB, dtype=torch.float32, device="cuda")
 
     image_r, depth_r = render_plane_image(ref_cam, plane_z, tex_fn)
     image_n, depth_n = render_plane_image(neighbor_cam, plane_z, tex_fn)
@@ -269,7 +283,7 @@ def check_cuda_vs_oracle(model_name, render_model, n_points=200, patch_radius=3,
     ncc_cuda, valid_cuda = multiview_ncc_ext.multiview_ncc_forward(
         depths, normals, pixels.int(), ray_dirs_r, R_rn, T_rn, image_r, image_n,
         neighbor_cam.render_model, neighbor_cam.focal_x, neighbor_cam.focal_y,
-        neighbor_cam.principal_x, neighbor_cam.principal_y, radius,
+        neighbor_cam.principal_x, neighbor_cam.principal_y, *kb_of(neighbor_cam), radius,
     )
 
     valid_agree = (valid_cuda == valid_oracle)
@@ -350,6 +364,7 @@ def check_backward_vs_oracle_autograd(model_name, render_model, n_points=64, pat
         depths_c, normals_c, pixels.int(), ray_dirs_r, R_rn, T_rn, image_r, image_n,
         neighbor_cam.render_model, neighbor_cam.focal_x, neighbor_cam.focal_y,
         neighbor_cam.principal_x, neighbor_cam.principal_y, radius,
+        dist_n=getattr(neighbor_cam, 'distortion_coeffs', None),
     )
     (ncc_c.sum()).backward()
     grad_depths_cuda = depths_c.grad.clone()
@@ -474,12 +489,12 @@ def check_analytic_backward_vs_oracle(model_name, render_model, n_points=256, pa
     ncc_c, valid_c = multiview_ncc_ext.multiview_ncc_forward(
         depths0, normals0, pixels.int(), ray_dirs_r, R_rn, T_rn, image_r, image_n,
         neighbor_cam.render_model, neighbor_cam.focal_x, neighbor_cam.focal_y,
-        neighbor_cam.principal_x, neighbor_cam.principal_y, patch_radius,
+        neighbor_cam.principal_x, neighbor_cam.principal_y, *kb_of(neighbor_cam), patch_radius,
     )
     gd_c, gn_c = multiview_ncc_ext.multiview_ncc_backward(
         depths0, normals0, pixels.int(), ray_dirs_r, R_rn, T_rn, image_r, image_n,
         neighbor_cam.render_model, neighbor_cam.focal_x, neighbor_cam.focal_y,
-        neighbor_cam.principal_x, neighbor_cam.principal_y, patch_radius,
+        neighbor_cam.principal_x, neighbor_cam.principal_y, *kb_of(neighbor_cam), patch_radius,
         torch.ones_like(ncc_c), precise=True,
     )
     # Fast (float-internals) variant: report-only stats against the same f64
@@ -491,7 +506,7 @@ def check_analytic_backward_vs_oracle(model_name, render_model, n_points=256, pa
     gd_f, gn_f = multiview_ncc_ext.multiview_ncc_backward(
         depths0, normals0, pixels.int(), ray_dirs_r, R_rn, T_rn, image_r, image_n,
         neighbor_cam.render_model, neighbor_cam.focal_x, neighbor_cam.focal_y,
-        neighbor_cam.principal_x, neighbor_cam.principal_y, patch_radius,
+        neighbor_cam.principal_x, neighbor_cam.principal_y, *kb_of(neighbor_cam), patch_radius,
         torch.ones_like(ncc_c), precise=False,
     )
 
@@ -567,6 +582,7 @@ def check_analytic_vs_fd_backward(model_name, render_model, n_points=256, patch_
                 d, n, pixels.int(), ray_dirs_r, R_rn, T_rn, image_r, image_n,
                 neighbor_cam.render_model, neighbor_cam.focal_x, neighbor_cam.focal_y,
                 neighbor_cam.principal_x, neighbor_cam.principal_y, patch_radius,
+                dist_n=getattr(neighbor_cam, 'distortion_coeffs', None),
             )
             ncc.sum().backward()
             return ncc.detach(), valid, d.grad.clone(), n.grad.clone()
@@ -611,6 +627,7 @@ def benchmark_backward_modes(model_name, render_model, n_points=10000, patch_rad
             d, n, pixels.int(), ray_dirs_r, R_rn, T_rn, image_r, image_n,
             neighbor_cam.render_model, neighbor_cam.focal_x, neighbor_cam.focal_y,
             neighbor_cam.principal_x, neighbor_cam.principal_y, patch_radius,
+            dist_n=getattr(neighbor_cam, 'distortion_coeffs', None),
         )
         ncc.sum().backward()
 
@@ -671,6 +688,15 @@ def main():
     print("\n=== Step 6 (Phase 2): analytic vs calibrated-FD backward (full autograd path) ===")
     check_analytic_vs_fd_backward("PH", render_model=2)
     check_analytic_vs_fd_backward("EQ", render_model=1)
+
+    print("\n=== Step 6b: KB lens on the neighbour camera (CUDA vs oracle, FD and analytic backward) ===")
+    global NEIGHBOR_KB
+    NEIGHBOR_KB = KB_TEST
+    check_cuda_vs_oracle("KB", render_model=1)
+    check_backward_vs_oracle_autograd("KB", render_model=1)
+    check_analytic_backward_vs_oracle("KB", render_model=1)
+    check_analytic_vs_fd_backward("KB", render_model=1)
+    NEIGHBOR_KB = None
 
     print("\n=== Step 7 (Phase 2): fwd+backward timing, FD vs analytic ===")
     benchmark_backward_modes("PH", render_model=2)

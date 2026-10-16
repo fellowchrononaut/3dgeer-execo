@@ -16,7 +16,7 @@
 #include <torch/extension.h>
 #include <tuple>
 
-// render_model_n: 1 = KB/EQ (equidistant fisheye, undistorted), 2 = PH (pinhole).
+// render_model_n: 1 = KB/EQ (fisheye, KB radial model k1..k4; EQ = all zero), 2 = PH (pinhole).
 // Matches scene/cameras.py::Camera.render_model / gaussian_wrapping/fisheye_proj.py.
 std::tuple<torch::Tensor, torch::Tensor>
 MultiviewNCC(const torch::Tensor& depths,       // (P,) float, ref median depth at center pixel
@@ -30,6 +30,7 @@ MultiviewNCC(const torch::Tensor& depths,       // (P,) float, ref median depth 
              const int render_model_n,
              const float fx_n, const float fy_n,
              const float cx_n, const float cy_n,
+             const float k1_n, const float k2_n, const float k3_n, const float k4_n,
              const int patch_radius,
              const bool debug);
 
@@ -49,6 +50,7 @@ MultiviewNCCBackward(const torch::Tensor& depths,
                       const int render_model_n,
                       const float fx_n, const float fy_n,
                       const float cx_n, const float cy_n,
+                      const float k1_n, const float k2_n, const float k3_n, const float k4_n,
                       const int patch_radius,
                       const torch::Tensor& grad_ncc,
                       const bool precise,

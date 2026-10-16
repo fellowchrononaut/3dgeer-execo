@@ -35,6 +35,7 @@ void multiview_ncc_forward_launcher(
     const int render_model_n,  // 1 = KB/EQ, 2 = PH
     const float fx_n, const float fy_n,
     const float cx_n, const float cy_n,
+    const float k1_n, const float k2_n, const float k3_n, const float k4_n,
     const int Hr, const int Wr,
     const int Hn, const int Wn,
     const int patch_radius,
@@ -65,6 +66,7 @@ void multiview_ncc_backward_launcher(
     const int render_model_n,  // 1 = KB/EQ, 2 = PH
     const float fx_n, const float fy_n,
     const float cx_n, const float cy_n,
+    const float k1_n, const float k2_n, const float k3_n, const float k4_n,
     const int Hr, const int Wr,
     const int Hn, const int Wn,
     const int patch_radius,
