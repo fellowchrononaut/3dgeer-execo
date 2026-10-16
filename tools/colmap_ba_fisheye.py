@@ -188,8 +188,16 @@ def filter_observations(rec, max_error):
     return n
 
 
-def write_training_colmap(ba_dir, out_colmap, scale):
-    """cameras.txt / cameras_fish.txt at the training size; images/points as the BA model."""
+def write_training_colmap(ba_dir, out_colmap, scale, legacy_pixel_centers=False):
+    """cameras.txt / cameras_fish.txt at the training size; images/points as the BA model.
+
+    Pixel centres: COLMAP puts the centre of pixel k at k + 0.5, while 3DGEER's
+    KB/EQ path (ray maps from tools/fisheye_raymap.py, gaussian_wrapping/
+    fisheye_proj.py, the rasterizer's projection) puts it at k. Pixel j of the
+    image downscaled by `scale` covers COLMAP coordinates around (j + 0.5) / scale,
+    so the principal point written here is c_colmap * scale - 0.5. (Until
+    2026-10-16 it was c_colmap * scale: a 0.5 px offset at the training size;
+    legacy_pixel_centers=True reproduces that.)"""
     os.makedirs(out_colmap, exist_ok=True)
     cams, _, points = read_text_model(ba_dir)
     lines = ["# Camera list with one line of data per camera:",
@@ -197,7 +205,9 @@ def write_training_colmap(ba_dir, out_colmap, scale):
              f"# Number of cameras: {len(cams)}"]
     for c, (model, W, H, p) in sorted(cams.items()):
         q = p.copy()
-        q[:4] *= scale  # same convention as the earlier x5 datasets: c_train = c_obs * scale
+        q[:4] *= scale
+        if not legacy_pixel_centers:
+            q[2:4] -= 0.5   # COLMAP (+0.5) -> integer pixel centres, see the docstring
         lines.append(f"{c} {model} {round(W * scale)} {round(H * scale)} " + " ".join(repr(float(v)) for v in q))
     for fn in ("cameras.txt", "cameras_fish.txt"):
         open(os.path.join(out_colmap, fn), "w").write("\n".join(lines) + "\n")
@@ -247,6 +257,8 @@ def main():
     ap.add_argument("--max_error", type=float, default=4.0, help="drop observations above this (obs px) after pass 1")
     ap.add_argument("--loss_scale", type=float, default=1.0, help="soft-L1 scale of pass 1 (obs px)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--legacy_pixel_centers", action="store_true",
+                    help="write c_colmap * scale (the pre-2026-10-16 0.5 px offset) instead of c_colmap * scale - 0.5")
     a = ap.parse_args()
 
     split_dir = os.path.join(a.out, "colmap_split_init")
@@ -287,7 +299,7 @@ def main():
     for c in (0, 1):
         report.append(f"  {LENS_NAMES[c]:5s} (camera {c}): " + " ".join(f"{v:.6g}" for v in cams1[c][3]))
 
-    write_training_colmap(ba_dir, os.path.join(a.out, "colmap"), scale)
+    write_training_colmap(ba_dir, os.path.join(a.out, "colmap"), scale, a.legacy_pixel_centers)
     main_from_colmap(os.path.join(a.out, "colmap", "cameras_fish.txt"),
                      os.path.join(a.out, "raymap_fisheye_cam{cam_id}.npy"))
     shutil.rmtree(split_dir)
