@@ -20,20 +20,24 @@ CAM_ID_PLACEHOLDER = "{cam_id}"
 def load_raymap(raymap_path):
     """None | np.ndarray (shared) | dict {camera_id: np.ndarray} (per camera).
 
+    Converted to float32 here, once: Camera keeps a float32 raymap as is, so
+    every image of a lens shares one array (and one GPU ray-dir cache entry,
+    utils/ray_normals.get_ray_dirs_view); other dtypes were copied per image.
+
     A missing single-file path returns None, as the callers did before; a
     per-camera pattern that matches nothing is an error.
     """
     if not raymap_path:
         return None
     if CAM_ID_PLACEHOLDER not in raymap_path:
-        return np.load(raymap_path) if os.path.exists(raymap_path) else None
+        return np.load(raymap_path).astype(np.float32, copy=False) if os.path.exists(raymap_path) else None
 
     regex = re.compile(re.escape(raymap_path).replace(re.escape(CAM_ID_PLACEHOLDER), r"(\d+)"))
     raymaps = {}
     for f in sorted(glob.glob(raymap_path.replace(CAM_ID_PLACEHOLDER, "*"))):
         m = regex.fullmatch(f)
         if m:
-            raymaps[int(m.group(1))] = np.load(f)
+            raymaps[int(m.group(1))] = np.load(f).astype(np.float32, copy=False)
     if not raymaps:
         raise FileNotFoundError(f"no per-camera ray maps match {raymap_path!r}")
     shapes = {k: v.shape for k, v in raymaps.items()}

@@ -6,24 +6,34 @@ import torch
 import torch.nn.functional as F
 
 
-# KB/EQ ray directions shared by every camera of the same raymap (one per
-# lens): a per-camera cache held a 3xHxW float copy for each image on the
-# GPU (44 MB at 1920^2, ~17 GB over 382 images once multiview had touched them).
-_KB_RAY_DIRS = {}
+# View-space ray directions are shared by every camera with the same ray
+# geometry (one raymap per lens for KB/EQ; same size + focal for PH; same
+# tan grids for BEAP). A per-camera cache held a 3xHxW float copy for each
+# image on the GPU (44 MB at 1920^2, ~17 GB over 382 images once multiview
+# had touched them).
+# Values are (anchor, dirs): the anchor keeps a KB/EQ raymap alive so its
+# data_ptr, part of the key, cannot be reused by a different raymap.
+_RAY_DIRS = {}
+
+
+def _ray_dirs_key(camera):
+    H, W = camera.image_height, camera.image_width
+    if camera.render_model == 1:          # KB/EQ: the raymap array itself
+        return ("raymap", camera.raymap.data_ptr(), H, W)
+    if camera.render_model == 2:          # PH: analytic from size + focal
+        return ("ph", H, W, float(camera.focal_x), float(camera.focal_y))
+    return ("beap", H, W, camera.tan_theta.cpu().numpy().tobytes(), camera.tan_phi.cpu().numpy().tobytes())
 
 
 def get_ray_dirs_view(camera):
-    """(3,H,W) unit ray directions in view space. Cached per raymap (KB/EQ)
-    or on the camera (PH/BEAP)."""
+    """(3,H,W) unit ray directions in view space, cached per ray geometry."""
+    key = _ray_dirs_key(camera)
+    if key in _RAY_DIRS:
+        return _RAY_DIRS[key][1]
     H, W = camera.image_height, camera.image_width
     if camera.render_model == 1:          # KB/EQ: per-pixel raymap (H,W,3)
-        key = (camera.raymap.data_ptr(), H, W)
-        if key not in _KB_RAY_DIRS:
-            _KB_RAY_DIRS[key] = F.normalize(camera.raymap.cuda().permute(2, 0, 1).float(), dim=0)
-        return _KB_RAY_DIRS[key]
-    if getattr(camera, "_ray_dirs_view", None) is not None:
-        return camera._ray_dirs_view
-    if camera.render_model == 2:          # PH: analytic pinhole rays
+        dirs = camera.raymap.cuda().permute(2, 0, 1).float()
+    elif camera.render_model == 2:        # PH: analytic pinhole rays
         ys, xs = torch.meshgrid(torch.arange(H, device="cuda"),
                                  torch.arange(W, device="cuda"), indexing="ij")
         dirs = torch.stack([(xs + 0.5) / camera.focal_x - W / (2.0 * camera.focal_x),
@@ -33,8 +43,9 @@ def get_ray_dirs_view(camera):
         tt = camera.tan_theta.cuda(); tp = camera.tan_phi.cuda()
         dirs = torch.stack([tt[None, :].expand(H, W), tp[:, None].expand(H, W),
                              torch.ones(H, W, device="cuda")], dim=0)
-    camera._ray_dirs_view = F.normalize(dirs, dim=0)
-    return camera._ray_dirs_view
+    anchor = camera.raymap if camera.render_model == 1 else None
+    _RAY_DIRS[key] = (anchor, F.normalize(dirs, dim=0))
+    return _RAY_DIRS[key][1]
 
 
 @torch.no_grad()

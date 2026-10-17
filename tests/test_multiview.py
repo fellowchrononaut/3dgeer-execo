@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from gaussian_wrapping.fields import view_to_world
 from gaussian_wrapping.fisheye_proj import project_view_to_pixel
 from utils.graphics_utils import getWorld2View2
-from utils.ray_normals import get_ray_dirs_view
+from utils.ray_normals import get_ray_dirs_view, _RAY_DIRS, _ray_dirs_key
 import utils.multiview as multiview_mod
 from utils.multiview import (
     expected_depth_from_invdepth,
@@ -71,8 +71,6 @@ def make_camera(render_model, R, T, W, H, focal=140.0, fov_deg=70.0):
     wvt = torch.tensor(getWorld2View2(R, T)).transpose(0, 1).float().cuda()
     cam.world_view_transform = wvt
     cam.camera_center = wvt.inverse()[3, :3]
-    cam._ray_dirs_view = None
-
     if render_model == 2:  # PH
         cam.focal_x = focal
         cam.focal_y = focal
@@ -465,10 +463,11 @@ def check_analytic_backward_vs_oracle(model_name, render_model, n_points=256, pa
     # Oracle exact autograd in float64 (identical f32 input values, upcast).
     wvt_r = ref_cam.world_view_transform
     wvt_n = neighbor_cam.world_view_transform
-    rays_f32 = ref_cam._ray_dirs_view
+    rays_key = _ray_dirs_key(ref_cam)
+    rays_entry = _RAY_DIRS[rays_key]
     ref_cam.world_view_transform = wvt_r.double()
     neighbor_cam.world_view_transform = wvt_n.double()
-    ref_cam._ray_dirs_view = rays_f32.double()
+    _RAY_DIRS[rays_key] = (rays_entry[0], rays_entry[1].double())
     try:
         depths_o = depths0.double().clone().requires_grad_(True)
         normals_o = normals0.double().clone().requires_grad_(True)
@@ -483,7 +482,7 @@ def check_analytic_backward_vs_oracle(model_name, render_model, n_points=256, pa
     finally:
         ref_cam.world_view_transform = wvt_r
         neighbor_cam.world_view_transform = wvt_n
-        ref_cam._ray_dirs_view = rays_f32
+        _RAY_DIRS[rays_key] = rays_entry
 
     # Analytic CUDA backward (grad_ncc = ones == d(sum ncc)/d(ncc)).
     ncc_c, valid_c = multiview_ncc_ext.multiview_ncc_forward(
