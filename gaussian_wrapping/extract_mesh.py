@@ -81,6 +81,10 @@ def main():
     parser.add_argument("--raymap_path", type=str, default=None)
     parser.add_argument("--near_threshold", type=float, default=0.2,
                         help="rasterizer near culling, as in training (PipelineParams); < 0 = by ray distance")
+    parser.add_argument("--max_view_theta_deg", type=float, default=89.0,
+                        help="KB/EQ: a view counts for a point only within this angle of its optical "
+                             "axis (gaussian_wrapping/fisheye_proj.py). Below 90 it also skips the rim where "
+                             "the rasterizer drops Gaussians whose 3-sigma extent crosses the camera plane")
 
     parser.add_argument("--iso", type=float, default=0.0)
     # Session E2.1: GW's actual "ours"-script default is 3.0; 3.33 is only
@@ -151,6 +155,9 @@ def main():
         raymap_path=args.raymap_path,
         near_threshold=args.near_threshold,
     )
+    import math
+    from gaussian_wrapping import fisheye_proj
+    fisheye_proj._EQ_MAX_THETA = math.radians(args.max_view_theta_deg)
     print(f"[extract_mesh] loaded {gaussians.get_xyz.shape[0]} Gaussians from "
           f"{args.model_path} @ iteration {args.iteration}")
 

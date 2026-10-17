@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import math
 import os
 import torch
 import numpy as np
@@ -26,7 +27,7 @@ from utils.image_utils import match_mask_to_image
 def visualize(dataset, opt, pipe, iteration, sample_step, fov_mod, mask_path,
               sibr_mask_refcam=None, render_model='BEAP', focal_scaling=1.0,
               distortion_scaling=1.0, mirror_shift=0.0, raymap_path=None,
-              near_threshold=0.2):
+              near_threshold=0.2, view_theta_max_deg=90.0):
     """
     Load a trained checkpoint and serve the SIBR online viewer via network_gui.
     This mirrors the network_gui loop from train.py but runs indefinitely after
@@ -120,6 +121,15 @@ def visualize(dataset, opt, pipe, iteration, sample_step, fov_mod, mask_path,
                         if valid_mask is not None:
                             net_image[match_mask_to_image(valid_mask, net_image) == 0] = 0.0
 
+                        # KB/EQ: pixels whose ray is more than view_theta_max_deg off the
+                        # optical axis are black. The raymap extends past 90 deg (lens-circle
+                        # corners), where 3DGEER's tangent-space bounds do not hold and no
+                        # loss ever looked (training masks stop at 90 deg).
+                        if view_theta_max_deg and getattr(custom_cam, "raymap", None) is not None:
+                            rz = custom_cam.raymap[..., 2].to(net_image.device)
+                            if rz.shape == net_image.shape[1:]:
+                                net_image[:, rz < math.cos(math.radians(view_theta_max_deg))] = 0.0
+
                         net_image = torch.nn.functional.interpolate(
                             net_image[None, ...], (height, width), mode='bilinear')[0]
                         net_image_bytes = memoryview(
@@ -158,6 +168,9 @@ if __name__ == "__main__":
     parser.add_argument('--mirror_shift', type=float, default=0.0)
     parser.add_argument('--raymap_path', type=str, default=None,
                         help="Path to pre-generated raymap .npy file (required for KB mode)")
+    parser.add_argument('--view_theta_max_deg', type=float, default=90.0,
+                        help="KB: black out pixels whose ray is more than this many degrees off "
+                             "the optical axis (0 = show everything)")
 
     args = get_combined_args(parser)
 
@@ -201,4 +214,5 @@ if __name__ == "__main__":
         args.mirror_shift,
         args.raymap_path,
         args.near_threshold,
+        args.view_theta_max_deg,
     )
