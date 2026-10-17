@@ -32,6 +32,11 @@ for ext in submodules/geer-rasterizer submodules/multiview_ncc; do
     ( cd "${ext}" && python setup.py build_ext --inplace )
 done
 
+# CGAL Delaunay extension for --delaunay cgal: pinned CGAL/pybind11 archives
+# into build/_deps (needs network once, or the archives copied there), built
+# into build/tetra_triangulation, which hpc/env.sh puts on PYTHONPATH.
+bash tools/build_cgal_triangulation.sh "${REPO_DIR}/build/tetra_triangulation"
+
 echo "==> verifying imports resolve to the in-place builds"
 python - <<'PY'
 import diff_gaussian_rasterization as d, multiview_ncc as m, torch

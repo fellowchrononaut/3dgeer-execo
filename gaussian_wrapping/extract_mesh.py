@@ -91,7 +91,11 @@ def main():
     # their radegs script's setting (was mistakenly folded in as the default
     # here in Session E2 -- see 3DGEERGW_EXECUTION.md Session E2.1 item 4).
     parser.add_argument("--std_factor", type=float, default=3.0)
-    parser.add_argument("--max_pivots", type=int, default=1_500_000)
+    parser.add_argument("--max_pivots", type=int, default=1_500_000,
+                        help="cap on pivots (2 per Gaussian, most opaque first); <= 0 = no cap "
+                             "(use with --delaunay cgal; scipy runs out of memory above ~1.5-2 M)")
+    parser.add_argument("--delaunay", type=str, default="scipy", choices=["scipy", "cgal"],
+                        help="tetrahedralization backend (gaussian_wrapping/delaunay_backend.py)")
     parser.add_argument("--trunc_margin", type=float, default=None)
     parser.add_argument("--n_binary_steps", type=int, default=10)
     # -- Session E2: exact ray-integrated occupancy field --------------------
@@ -205,7 +209,8 @@ def main():
         output_path=args.output,
         iso=args.iso,
         std_factor=args.std_factor,
-        max_pivots=args.max_pivots,
+        max_pivots=args.max_pivots if args.max_pivots > 0 else None,
+        delaunay=args.delaunay,
         trunc_margin=args.trunc_margin,
         n_binary_steps=args.n_binary_steps,
         max_radius_factor=args.max_radius_factor,

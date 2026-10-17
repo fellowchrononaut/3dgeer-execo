@@ -259,6 +259,11 @@ def main():
     parser.add_argument("--distortion_scaling", type=float, default=1.0)
     parser.add_argument("--mirror_shift", type=float, default=0.0)
     parser.add_argument("--raymap_path", type=str, default=None)
+    parser.add_argument("--near_threshold", type=float, default=0.2,
+                        help="rasterizer near culling, as in training/extract_mesh.py; < 0 = by ray distance")
+    parser.add_argument("--max_view_theta_deg", type=float, default=89.0,
+                        help="KB/EQ: a view counts for a point only within this angle of its optical axis "
+                             "(as extract_mesh.py --max_view_theta_deg)")
 
     parser.add_argument("--input_mesh", type=str, required=True)
     parser.add_argument("--output_mesh", type=str, required=True)
@@ -300,6 +305,9 @@ def main():
                               "(matches GW's own default).")
 
     parser.add_argument("--max_points", type=int, default=1_000_000, help="Target number of final candidate points")
+    parser.add_argument("--delaunay", type=str, default="scipy", choices=["scipy", "cgal"],
+                        help="tetrahedralization backend (gaussian_wrapping/delaunay_backend.py); scipy runs out "
+                             "of host memory above ~1.5-2 M points, cgal does not")
     parser.add_argument("--p_per_tet", type=int, default=10, help="Points per tet for occupancy check (1 = tet barycenter)")
     parser.add_argument("--n_steps", type=int, default=10, help="Newton refinement steps")
     parser.add_argument("--vacancy_threshold", type=float, default=0.1, help="|field - iso| filter threshold")
@@ -329,8 +337,11 @@ def main():
         camera_model=args.camera_model, iteration=args.iteration, render_model=args.render_model,
         sample_step=args.sample_step, focal_scaling=args.focal_scaling,
         distortion_scaling=args.distortion_scaling, mirror_shift=args.mirror_shift,
-        raymap_path=args.raymap_path,
+        raymap_path=args.raymap_path, near_threshold=args.near_threshold,
     )
+    import math
+    from gaussian_wrapping import fisheye_proj
+    fisheye_proj._EQ_MAX_THETA = math.radians(args.max_view_theta_deg)
     cameras = scene.getTrainCameras()
     print(f"[pam] loaded {gaussians.get_xyz.shape[0]} Gaussians, {len(cameras)} cameras "
           f"from {args.model_path} @ iteration {args.iteration}")
@@ -491,7 +502,7 @@ def main():
 
     # -- 6. Delaunay + tet classification + boundary-triangle extraction ----
     t0 = time.time()
-    mfd = MeshFromDelaunay(points, add_corners=False)
+    mfd = MeshFromDelaunay(points, add_corners=False, backend=args.delaunay)
     stats["n_tets"] = int(mfd.simplices.shape[0])
     stats["t_delaunay_sec"] = time.time() - t0
     print(f"[pam] Delaunay: {stats['n_tets']} tets ({stats['t_delaunay_sec']:.1f}s)")

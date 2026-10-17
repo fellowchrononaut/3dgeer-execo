@@ -205,6 +205,64 @@ __forceinline__ __device__ float mirror_transform_tan(const float m, const float
 // of rays that intersect the Gaussian's λ-sigma ellipsoid.  It is defined as
 //   pbf = {tan_theta_min, tan_theta_max, tan_phi_min, tan_phi_max}
 // and maps directly to pixel ranges via the BEAP reference arrays or the KB grid.
+// KB/EQ (mode 1): pixel bounds for a Gaussian whose lambda-sigma ellipsoid
+// crosses the camera plane (lambda^2 Sigma_zz >= z^2). Its tangent-space PBF
+// (computePBF) is undefined there -- the tangents of a region straddling z = 0
+// are not an interval -- so it used to be dropped from the view entirely: with
+// a ~180 deg fisheye that leaves holes near 90 deg off-axis (ceiling straight
+// above / floor straight below the camera) in renders, training and mesh
+// extraction. Bound it instead by the cone of directions its lambda-sigma
+// bounding sphere subtends, projected through the KB model (valid past 90 deg):
+// the bbox of 32 cone-boundary projections (+ the principal point if the cone
+// contains the optical axis), padded. Returns false (dropped, as before) when
+// the camera is inside the bounding sphere.
+__device__ bool coneBoundKB(
+	const glm::vec3 scale, const float mod, const float h_var, const float3 p_view, const float lambda,
+	const int W, const int H, const float focal_x, const float focal_y,
+	const float principal_x, const float principal_y, const float4 kb,
+	int* u_indices, int* v_indices)
+{
+	const float s2 = fmaxf(fmaxf(sq(scale.x * mod), sq(scale.y * mod)), sq(scale.z * mod)) + h_var;
+	const float Rb = lambda * sqrtf(s2);
+	const float d = sqrtf(sq(p_view.x) + sq(p_view.y) + sq(p_view.z));
+	if (!(d > Rb)) return false;
+	const float sa = Rb / d, ca = sqrtf(fmaxf(0.f, 1.f - sa * sa));
+	const float3 c = { p_view.x / d, p_view.y / d, p_view.z / d };
+	const float3 a = fabsf(c.z) < 0.9f ? make_float3(0.f, 0.f, 1.f) : make_float3(1.f, 0.f, 0.f);
+	float3 e1 = { c.y * a.z - c.z * a.y, c.z * a.x - c.x * a.z, c.x * a.y - c.y * a.x };
+	const float n1 = sqrtf(sq(e1.x) + sq(e1.y) + sq(e1.z));
+	e1 = { e1.x / n1, e1.y / n1, e1.z / n1 };
+	const float3 e2 = { c.y * e1.z - c.z * e1.y, c.z * e1.x - c.x * e1.z, c.x * e1.y - c.y * e1.x };
+	const float theta_cap = 1.9199f;   // 110 deg: past every lens-circle corner; keeps the KB polynomial sane
+	float umin = INFINITY, umax = -INFINITY, vmin = INFINITY, vmax = -INFINITY;
+	for (int k = 0; k < 32; k++) {
+		float sp, cp;
+		sincosf(6.2831853f * k / 32.f, &sp, &cp);
+		const float dx = ca * c.x + sa * (cp * e1.x + sp * e2.x);
+		const float dy = ca * c.y + sa * (cp * e1.y + sp * e2.y);
+		const float dz = ca * c.z + sa * (cp * e1.z + sp * e2.z);
+		const float r = sqrtf(dx * dx + dy * dy);
+		float u = principal_x, v = principal_y;
+		if (r > 1e-9f) {
+			const float th = fminf(atan2f(r, dz), theta_cap), t2 = th * th, t4 = t2 * t2;
+			const float thd = th * (1.f + kb.x * t2 + kb.y * t4 + kb.z * t2 * t4 + kb.w * t4 * t4);
+			u = principal_x + focal_x * thd * dx / r;
+			v = principal_y + focal_y * thd * dy / r;
+		}
+		umin = fminf(umin, u); umax = fmaxf(umax, u); vmin = fminf(vmin, v); vmax = fmaxf(vmax, v);
+	}
+	if (c.z >= ca) {   // cone contains the optical axis
+		umin = fminf(umin, principal_x); umax = fmaxf(umax, principal_x);
+		vmin = fminf(vmin, principal_y); vmax = fmaxf(vmax, principal_y);
+	}
+	const float pu = 0.03f * (umax - umin) + 2.f, pv = 0.03f * (vmax - vmin) + 2.f;   // between-sample bulge
+	u_indices[0] = (int)fminf(fmaxf(floorf(umin - pu), 0.f), (float)(W - 1));
+	u_indices[1] = (int)fminf(fmaxf(ceilf(umax + pu), 0.f), (float)(W - 1));
+	v_indices[0] = (int)fminf(fmaxf(floorf(vmin - pv), 0.f), (float)(H - 1));
+	v_indices[1] = (int)fminf(fmaxf(ceilf(vmax + pv), 0.f), (float)(H - 1));
+	return u_indices[1] > u_indices[0] && v_indices[1] > v_indices[0];
+}
+
 // See 3DGEER paper (https://openreview.net/pdf?id=4voMNlRWI7), Sec. D / Eq. 10.
 // Returns false if the Gaussian is degenerate or entirely outside the frustum.
 __device__ bool computePBF(
@@ -898,6 +956,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// Any value outside [0, 2] falls back to PBF.
 	float4 tan_xxyy; // clamped tan value in x / y dir, i.e., tan_theta, tan_phi
 	bool tighten = false;
+	bool crosses_plane = false;
+	int cone_aa[2], cone_bb[2];
 	if (asso_mode == 1) {
 		if (!computeAABB_EWA(scales[idx], scale_modifier, R_view, p_view, cutoff, tan_xxyy, tan_fovx, tan_fovy, h_opacity[idx].x, tighten)) return;
 	} else if (asso_mode == 2) {
@@ -905,7 +965,25 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	} else {
 		// Default: asso_mode == 0, use PBF
 		// see details in 3DGEER paper: https://openreview.net/pdf?id=4voMNlRWI7, Eq.10 (mathmatical proof in Sec.D.1)
-		if (!computePBF(scales[idx], scale_modifier, R_view, p_view, cutoff, tan_xxyy, tan_fovx, tan_fovy, h_opacity[idx].x)) return;
+		if (mode == 1) {
+			// KB/EQ: a Gaussian crossing the camera plane gets cone bounds (coneBoundKB)
+			// instead of the (undefined) tangent-space PBF.
+			const glm::vec3 sc = scales[idx];
+			const float hv = h_opacity[idx].x;
+			const float szz = sq(R_view[0].z) * (sq(sc.x * scale_modifier) + hv)
+			                + sq(R_view[1].z) * (sq(sc.y * scale_modifier) + hv)
+			                + sq(R_view[2].z) * (sq(sc.z * scale_modifier) + hv);
+			crosses_plane = sq(cutoff) * szz - sq(p_view.z) >= 0.f;
+		}
+		if (crosses_plane) {
+			const float4 kb = reinterpret_cast<const float4*>(distortion_coeffs)[0];
+			// The per-ray D <= 3 cut (renderCUDA, backward, occupancy) keeps every
+			// contributing ray inside the 3-sigma bounding-sphere cone.
+			if (!coneBoundKB(scales[idx], scale_modifier, h_opacity[idx].x, p_view, cutoff, W, H,
+			                 focal_x, focal_y, principal_x, principal_y, kb, cone_aa, cone_bb)) return;
+			// per-ray tangent test (renderCUDA, backward, occupancy) always passes
+			tan_xxyy = make_float4(-INFINITY, INFINITY, -INFINITY, INFINITY);
+		} else if (!computePBF(scales[idx], scale_modifier, R_view, p_view, cutoff, tan_xxyy, tan_fovx, tan_fovy, h_opacity[idx].x)) return;
 	}
 
 	if ((tan_xxyy.y - tan_xxyy.x) * (tan_xxyy.w - tan_xxyy.z) == 0)
@@ -917,6 +995,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	{
 		// Convert PBF into BEAP space;
 		searchsorted_pbf(mirror_transformed_tan_x, W, mirror_transformed_tan_y, H, (float*)(&tan_xxyy), _aa, _bb);
+	} else if (mode == 1 && crosses_plane) {
+		_aa[0] = cone_aa[0]; _aa[1] = cone_aa[1]; _bb[0] = cone_bb[0]; _bb[1] = cone_bb[1];
 	} else if (mode == 1) {
 		// Bound PBF into KB imaging space;
 		const float4* kb_params4 = reinterpret_cast<const float4*>(distortion_coeffs);
@@ -1104,6 +1184,11 @@ renderCUDA(
 			float power_mah = -0.5f * dot(normal, normal) / dot(d_obj, d_obj);
 
 			if (power_mah > 0.0f)
+				continue;
+			// KB/EQ cone-bounded Gaussians (coneBoundKB, tangent bounds +-inf): a ray
+			// contributes only within 3 sigma (D^2 <= 9), close to the tangent-PBF cut the
+			// others get, so a Gaussian moving across the camera-plane test barely changes the image.
+			if (mode == 1 && isinf(b_xxyy.x) && power_mah < -4.5f)
 				continue;
 
 			// Eq. (2) from 3D Gaussian splatting paper.
@@ -1354,6 +1439,11 @@ integrateCUDA(
 				float power_mah = -0.5f * dot(normal, normal) / dot(d_obj, d_obj);
 
 				if (power_mah > 0.0f)
+					continue;
+				// KB/EQ cone-bounded Gaussians (coneBoundKB, tangent bounds +-inf): a ray
+				// contributes only within 3 sigma (D^2 <= 9), close to the tangent-PBF cut the
+				// others get, so a Gaussian moving across the camera-plane test barely changes the image.
+				if (mode == 1 && isinf(b_xxyy.x) && power_mah < -4.5f)
 					continue;
 
 				// Session E2.1: soft depth attenuation (GOF forward.cu:1311-1313

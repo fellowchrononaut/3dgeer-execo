@@ -9,7 +9,7 @@ field (gaussian_wrapping/fields.py) instead of GW's own renderer stack.
 Pipeline (see extract_mesh_pivot_mtet):
   1. pivots <- gaussian_wrapping.pivots.extract_gaussian_pivots
   2. tsdf at pivots <- gaussian_wrapping.fields.fuse_tsdf_at_points
-  3. scipy.spatial.Delaunay tetrahedralization of the pivots (CPU/numpy;
+  3. Delaunay tetrahedralization of the pivots (scipy, or CGAL via --delaunay cgal; CPU;
      everything else stays in torch)
   4. marching tetrahedra at iso 0 (ported from GW's utils/tetmesh.py,
      unbatched -- 3DGEER never needs the batch dimension)
@@ -26,7 +26,7 @@ from typing import Optional
 import numpy as np
 import torch
 import trimesh
-from scipy.spatial import Delaunay
+from gaussian_wrapping.delaunay_backend import delaunay_tets   # scipy imported lazily (not in the MODUS image)
 
 from gaussian_wrapping.pivots import extract_gaussian_pivots, get_searched_pivots
 from gaussian_wrapping.fields import (
@@ -257,6 +257,7 @@ def extract_mesh_pivot_mtet(
     iso: float = 0.0,
     std_factor: float = 3.0,  # Session E2.1: GW's ours-script default (3.33 was their radegs script)
     max_pivots: Optional[int] = 1_500_000,
+    delaunay: str = "scipy",
     trunc_margin: Optional[float] = None,
     n_binary_steps: int = 10,
     max_radius_factor: Optional[float] = 2.0,
@@ -508,8 +509,7 @@ def extract_mesh_pivot_mtet(
     # -- 3. Delaunay --------------------------------------------------------
     t0 = time.time()
     pivots_np = pivots.detach().cpu().double().numpy()
-    delaunay = Delaunay(pivots_np)
-    tets = torch.from_numpy(delaunay.simplices.astype(np.int64)).to(pivots.device)
+    tets = torch.from_numpy(delaunay_tets(pivots_np, delaunay)).to(pivots.device)
     stats["t_delaunay_sec"] = time.time() - t0
     stats["n_tets"] = int(tets.shape[0])
     print(f"[mesh_extraction] Delaunay: {stats['n_tets']} tets in "

@@ -453,6 +453,11 @@ renderCUDA(
 				const float D2_m = dot(normal_m, normal_m) / dns_m;
 				const float pm_m = -0.5f * D2_m;
 				if (pm_m > 0.0f) continue;
+				// KB/EQ cone-bounded Gaussians (coneBoundKB, tangent bounds +-inf): a ray
+				// contributes only within 3 sigma (D^2 <= 9), close to the tangent-PBF cut the
+				// others get, so a Gaussian moving across the camera-plane test barely changes the image.
+				if (mode == 1 && isinf(collected_pbf_tan[j].x) && pm_m < -4.5f)
+					continue;
 				const float G_m = exp(pm_m);
 				const float a_m = min(0.99f, h_o_m.y * G_m);
 				if (a_m < 1.0f / 255.0f) continue;
@@ -552,6 +557,11 @@ renderCUDA(
 			const float power_mah = -0.5f * D2;
 
 			if (power_mah > 0.0f)
+				continue;
+			// KB/EQ cone-bounded Gaussians (coneBoundKB, tangent bounds +-inf): a ray
+			// contributes only within 3 sigma (D^2 <= 9), close to the tangent-PBF cut the
+			// others get, so a Gaussian moving across the camera-plane test barely changes the image.
+			if (mode == 1 && isinf(collected_pbf_tan[j].x) && power_mah < -4.5f)
 				continue;
 
 			const float G = exp(power_mah);

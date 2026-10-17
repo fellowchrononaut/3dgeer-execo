@@ -22,7 +22,8 @@ APPTAINER_MODULE="${APPTAINER_MODULE:-apptainer/1.4.5-3}"
 # PYTHONPATH makes the in-place-built extensions in the bind-mounted repo win
 # over the copies baked into the read-only SIF. PYTHONPATH precedes
 # site-packages in sys.path, so no reinstall is needed after a CUDA edit.
-GEER_PYTHONPATH="${REPO}/submodules/geer-rasterizer:${REPO}/submodules/multiview_ncc"
+# build/tetra_triangulation: the CGAL Delaunay extension (tools/build_cgal_triangulation.sh).
+GEER_PYTHONPATH="${REPO}/submodules/geer-rasterizer:${REPO}/submodules/multiview_ncc:${REPO}/build/tetra_triangulation"
 
 # Run a command inside the container with the GPU and GPFS visible.
 #   geer_exec python train.py ...

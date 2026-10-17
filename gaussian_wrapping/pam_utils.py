@@ -81,13 +81,24 @@ def tet_circumcenter(verts: np.ndarray) -> np.ndarray:
     return out
 
 
-class MeshFromDelaunay(Delaunay):
+class MeshFromDelaunay:
     """Delaunay tetrahedralization + tet-classification -> boundary-triangle
-    surface extraction. Verbatim port of GW's utils/primal_adaptive_meshing_
-    utils.py::MeshFromDelaunay (pure numpy/scipy)."""
+    surface extraction. Port of GW's utils/primal_adaptive_meshing_
+    utils.py::MeshFromDelaunay (pure numpy/scipy). GW subclasses
+    scipy.spatial.Delaunay; this holds points/simplices/neighbors instead, so
+    the tetrahedra can come from CGAL (`backend="cgal"`, delaunay_backend.py)
+    for inputs scipy cannot tetrahedralize in memory."""
 
-    def __init__(self, points: np.ndarray, add_corners: bool = False, **kwargs) -> None:
-        super().__init__(points, **kwargs)
+    def __init__(self, points: np.ndarray, add_corners: bool = False, backend: str = "scipy") -> None:
+        from gaussian_wrapping.delaunay_backend import delaunay_tets, tet_neighbors
+        self.points = np.asarray(points, dtype=np.float64)
+        if backend == "scipy":
+            d = Delaunay(self.points)
+            self.simplices, self.neighbors = d.simplices, d.neighbors
+            del d
+        else:
+            self.simplices = delaunay_tets(self.points, backend)
+            self.neighbors = tet_neighbors(self.simplices)
         self.add_corners = add_corners
         self.circum_centers = tet_circumcenter(self.points[self.simplices])
         self.barycenters = self.points[self.simplices].mean(1)
